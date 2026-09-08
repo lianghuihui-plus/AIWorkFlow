@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "purpose": "按每个阶段当时可见的信息评价语义质量，区分输入缺失与 Agent 可避免的错误。",
+  "rules": [
+    "不得因当时不可见、PRD 未提供或与 PRD 冲突的后续用户信息扣分。",
+    "PRD、用户反馈、用户决策、仓库事实和 Agent 推断必须分别评价，不能合并为笼统的准确性。",
+    "发现上游事实错误后，应评价最终是否完成上游修订和下游一致性，而不只评价当前文档是否局部改对。",
+    "工程默认值可以由 Agent 自主决定，但必须评价其依据、风险和验证点。"
+  ],
+  "evaluation_units": [
+    {
+      "id": "initial_analysis",
+      "visible_inputs": ["original_prd", "target_platform", "repository_snapshot"],
+      "criteria": ["prd_fidelity", "platform_filtering", "repository_fact_accuracy", "inference_labeling"]
+    },
+    {
+      "id": "feedback_convergence",
+      "visible_inputs": ["original_prd", "user_feedback", "user_decisions", "current_analysis"],
+      "criteria": ["latest_intent_priority", "scope_convergence", "source_traceability", "decision_supersession_accuracy"]
+    },
+    {
+      "id": "technical_design",
+      "visible_inputs": ["accepted_requirements", "approved_analysis", "repository_snapshot", "memory_context"],
+      "criteria": ["architecture_quality", "code_evidence_accuracy", "repository_scope_fidelity", "decision_rationale", "validation_design"]
+    },
+    {
+      "id": "final_consistency",
+      "visible_inputs": ["approved_artifacts", "requirement_projection", "task_projection", "routing_events"],
+      "criteria": ["upstream_correction_closure", "downstream_consistency", "withdrawn_context_isolation"]
+    }
+  ],
+  "required_score_fields": ["sample_id", "unit", "criterion", "score", "evidence", "visible_input_basis"]
+}
