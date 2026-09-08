@@ -229,9 +229,22 @@ class DashboardTests(unittest.TestCase):
 
         self.assertIn('href="#artifact-t-001-spec"', markup)
         self.assertIn('href="#artifact-t-001-implementation"', markup)
+        self.assertIn('<span class="task-requirements">需求：REQ-001</span>', markup)
+        self.assertIn('<span class="pill warn">已规划</span>', markup)
         self.assertIn("已批准", markup)
         self.assertIn("待审核", markup)
         self.assertIn("测试</span><strong>未生成", markup)
+
+    def test_task_status_pill_keeps_content_width(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = initialize_workspace(Path(directory))
+            content = (workspace / "dashboard.html").read_text(encoding="utf-8")
+
+        self.assertNotIn(".task-title span {", content)
+        self.assertIn(
+            ".task-title > .pill { width: fit-content; max-width: 100%; margin-top: 6px; }",
+            content,
+        )
 
     def test_explicit_render_does_not_change_structured_workspace_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -256,9 +256,10 @@ def render_dashboard(
     .requirement-meta {{ display: flex; flex-wrap: wrap; gap: 6px; }}
     .requirement-meta span {{ border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--card-bg); color: var(--muted); padding: 2px 7px; font-size: 12px; overflow-wrap: anywhere; }}
     .task-card {{ display: grid; grid-template-columns: minmax(220px, 1fr) minmax(360px, 1.5fr); gap: 12px; align-items: center; min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card-bg); padding: 14px; }}
-    .task-title strong, .task-title span {{ display: block; overflow-wrap: anywhere; }}
-    .task-title strong {{ color: var(--accent); }}
-    .task-title span {{ margin-top: 4px; color: var(--muted); font-size: 12px; }}
+    .task-title > strong, .task-title > .task-requirements {{ display: block; overflow-wrap: anywhere; }}
+    .task-title > strong {{ color: var(--accent); }}
+    .task-title > .task-requirements {{ margin-top: 4px; color: var(--muted); font-size: 12px; }}
+    .task-title > .pill {{ width: fit-content; max-width: 100%; margin-top: 6px; }}
     .task-checkpoints {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }}
     .task-checkpoint {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card-inner-bg); padding: 8px; color: inherit; text-decoration: none; }}
     a.task-checkpoint:hover {{ border-color: var(--accent-border); text-decoration: none; }}
@@ -901,7 +902,7 @@ def _render_tasks(
         cards.append(
             f"""
             <article class="task-card">
-              <div class="task-title"><strong>{_escape(item['id'])} · {_escape(item['title'])}</strong><span>需求：{_escape(requirements)}</span>{_pill(item['status'])}</div>
+              <div class="task-title"><strong>{_escape(item['id'])} · {_escape(item['title'])}</strong><span class="task-requirements">需求：{_escape(requirements)}</span>{_pill(item['status'])}</div>
               <div class="task-checkpoints">{''.join(checkpoints)}</div>
             </article>
             """
