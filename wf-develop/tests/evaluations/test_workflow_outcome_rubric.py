@@ -13,7 +13,13 @@ class WorkflowOutcomeRubricTests(unittest.TestCase):
         self.assertEqual(rubric["schema_version"], 1)
         self.assertEqual(
             {unit["id"] for unit in rubric["evaluation_units"]},
-            {"initial_analysis", "feedback_convergence", "technical_design", "final_consistency"},
+            {
+                "initial_analysis",
+                "feedback_convergence",
+                "technical_design",
+                "task_delivery",
+                "change_locality",
+            },
         )
         criteria = {
             criterion
@@ -28,8 +34,13 @@ class WorkflowOutcomeRubricTests(unittest.TestCase):
                 "latest_intent_priority",
                 "architecture_quality",
                 "code_evidence_accuracy",
-                "upstream_correction_closure",
-                "withdrawn_context_isolation",
+                "decision_context_visibility",
+                "task_isolation",
+                "test_independence",
+                "direct_impact_accuracy",
+                "unrelated_artifact_stability",
+                "reconciliation_closure",
+                "withdrawn_work_closure",
             }.issubset(criteria)
         )
         self.assertIn("visible_input_basis", rubric["required_score_fields"])

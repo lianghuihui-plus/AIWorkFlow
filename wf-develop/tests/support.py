@@ -64,3 +64,121 @@ def write_work_outputs(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def submit_and_approve(
+    engine: WorkflowEngine,
+    work: dict[str, object],
+    *,
+    markdown: str,
+    result: dict[str, object],
+) -> dict[str, object]:
+    write_work_outputs(engine, work, markdown=markdown, result=result)
+    submitted = engine.submit_work(str(work["work_id"]))
+    return engine.review_artifact(
+        str(submitted["artifact_id"]),
+        int(submitted["revision"]),
+        outcome="approved",
+    )
+
+
+def advance_to_tasks(
+    engine: WorkflowEngine,
+    tasks: list[dict[str, object]],
+) -> None:
+    analysis = engine.prepare_work()
+    submit_and_approve(
+        engine,
+        analysis,
+        markdown="# Analysis\n\nSave drafts.\n",
+        result={
+            "schema_version": 11,
+            "stage": "analysis",
+            "target_platform": "test",
+            "requirements": [
+                {
+                    "title": "Save drafts",
+                    "summary": "Persist and restore drafts.",
+                    "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                    "platform_scope": "target",
+                    "change_type": "new",
+                    "scope_reason": "Core target behavior.",
+                    "disposition": "proposed",
+                }
+            ],
+            "withdrawn_requirements": [],
+        },
+    )
+    design = engine.prepare_work()
+    submit_and_approve(
+        engine,
+        design,
+        markdown="# Design\n\nUse the application root.\n",
+        result={
+            "schema_version": 11,
+            "stage": "design",
+            "requirements": ["REQ-001"],
+            "design_mode": "anchored",
+            "greenfield_reason": None,
+            "code_evidence": [
+                {"path": "app.txt", "symbol": "ApplicationRoot", "purpose": "Integration root"}
+            ],
+        },
+    )
+    plan = engine.prepare_work()
+    submit_and_approve(
+        engine,
+        plan,
+        markdown="# Task plan\n\nIndependent task plan.\n",
+        result={
+            "schema_version": 11,
+            "stage": "specification",
+            "tasks": tasks,
+            "withdrawn_tasks": [],
+        },
+    )
+
+
+def approve_task_spec(engine: WorkflowEngine, task_id: str) -> None:
+    work = engine.prepare_work(active_item=task_id)
+    submit_and_approve(
+        engine,
+        work,
+        markdown=f"# {task_id} specification\n\nAcceptance: behavior is available.\n",
+        result={
+            "schema_version": 11,
+            "stage": "specification",
+            "task_id": task_id,
+            "acceptance_criteria": ["Behavior is available"],
+        },
+    )
+
+
+def approve_task_implementation(
+    engine: WorkflowEngine,
+    task_id: str,
+    *,
+    changed_files: list[str] | None = None,
+) -> None:
+    work = engine.prepare_work(active_item=task_id)
+    submit_and_approve(
+        engine,
+        work,
+        markdown=f"# {task_id} implementation\n\nAcceptance verified.\n",
+        result={
+            "schema_version": 11,
+            "stage": "implementation",
+            "task_id": task_id,
+            "summary": "The task behavior is available.",
+            "changed_files": list(changed_files or []),
+            "acceptance_results": [
+                {
+                    "criterion": "Behavior is available",
+                    "status": "passed",
+                    "evidence": "Current repository behavior was inspected.",
+                }
+            ],
+            "validation": ["Targeted verification passed."],
+            "risks": [],
+        },
+    )

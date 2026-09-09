@@ -1,732 +1,454 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from support import run_cli
-
-from aiwf_core.model import now_iso
-from aiwf_core.storage import InjectedTransactionFailure, json_bytes, sha256_bytes
-from aiwf_core.workflow import WorkflowEngine
-from integration.test_analysis_cli import initialize_workspace as initialize_base_workspace
-from integration.test_design_specification_cli import (
-    approve_analysis,
-    approve_design,
-    approve_task_plan,
-    run_success,
-    write_outputs,
+from support import (
+    advance_to_tasks,
+    approve_task_implementation,
+    approve_task_spec,
+    bootstrap_engine,
+    submit_and_approve,
+    write_work_outputs,
 )
+from aiwf_core.model import AIWorkflowError
 
 
-def initialize_workspace(root: Path) -> Path:
-    repository = root / "repository"
-    repository.mkdir()
-    return initialize_base_workspace(root, repository=repository)
-
-
-def submit_analysis_for_review(workspace: Path) -> dict[str, object]:
-    work = run_success(["prepare", "--workspace", str(workspace)])
-    write_outputs(
-        workspace,
-        work,
-        markdown="# Analysis\n\nUsers save drafts.\n",
+def advance_two_requirements(engine: object) -> None:
+    analysis = engine.prepare_work()
+    submit_and_approve(
+        engine,
+        analysis,
+        markdown="# Analysis\n\nDrafts and sync.\n",
         result={
-            "schema_version": 9,
+            "schema_version": 11,
             "stage": "analysis",
-            "target_platform": "web",
+            "target_platform": "test",
             "requirements": [
-                {
-                    "title": "Save drafts",
-                    "summary": "Users save drafts.",
-                    "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
-                    "platform_scope": "target",
-                    "change_type": "new",
-                    "scope_reason": "Implemented by the web client.",
-                    "disposition": "proposed",
-                }
+                {"title": "Drafts", "summary": "Persist drafts.", "sources": [{"kind": "prd", "ref": "prd/requirements.md"}], "platform_scope": "target", "change_type": "new", "scope_reason": "Target behavior.", "disposition": "proposed"},
+                {"title": "Sync", "summary": "Synchronize drafts.", "sources": [{"kind": "prd", "ref": "prd/requirements.md"}], "platform_scope": "target", "change_type": "new", "scope_reason": "Target behavior.", "disposition": "proposed"},
             ],
-            "memory_delta": [],
+            "withdrawn_requirements": [],
         },
     )
-    run_success(["submit", "--workspace", str(workspace), "--work-id", work["work_id"]])
-    return work
-
-
-def submit_analysis_revision(workspace: Path, *, revision: int = 1) -> dict[str, object]:
-    run_success(
-        [
-            "revise",
-            "--workspace",
-            str(workspace),
-            "--artifact-id",
-            "analysis",
-            "--revision",
-            str(revision),
-            "--feedback",
-            "Clarify the approved requirement.",
-        ]
+    design = engine.prepare_work()
+    submit_and_approve(
+        engine,
+        design,
+        markdown="# Design\n\nUse ApplicationRoot.\n",
+        result={
+            "schema_version": 11,
+            "stage": "design",
+            "requirements": ["REQ-001", "REQ-002"],
+            "design_mode": "anchored",
+            "greenfield_reason": None,
+            "code_evidence": [{"path": "app.txt", "symbol": "ApplicationRoot", "purpose": "Integration root"}],
+        },
     )
-    work = run_success(["prepare", "--workspace", str(workspace)])
-    result = json.loads((workspace / str(work["result_output"])).read_text(encoding="utf-8"))
-    result["requirements"][0]["summary"] = "Users save drafts with clarified behavior."
-    write_outputs(
-        workspace,
-        work,
-        markdown="# Analysis\n\nUsers save drafts with clarified behavior.\n",
-        result=result,
+    plan = engine.prepare_work()
+    submit_and_approve(
+        engine,
+        plan,
+        markdown="# Tasks\n\nThree tasks.\n",
+        result={
+            "schema_version": 11,
+            "stage": "specification",
+            "tasks": [
+                {"key": "a", "title": "Task A", "requirements": ["REQ-001"], "depends_on": []},
+                {"key": "b", "title": "Task B", "requirements": ["REQ-002"], "depends_on": ["a"]},
+                {"key": "c", "title": "Task C", "requirements": ["REQ-002"], "depends_on": []},
+            ],
+            "withdrawn_tasks": [],
+        },
     )
-    return run_success(
-        ["submit", "--workspace", str(workspace), "--work-id", str(work["work_id"])]
-    )
 
 
-class RecoveryRevisionCommandLineTests(unittest.TestCase):
-    def test_analysis_revision_can_be_approved_after_design_becomes_stale(self) -> None:
+class ReconciliationIntegrationTests(unittest.TestCase):
+    def test_analysis_revision_accepts_structured_change_when_markdown_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            approve_analysis(workspace)
-            approve_design(workspace, ["REQ-001"])
-
-            submitted = submit_analysis_revision(workspace)
-            status = run_success(["status", "--workspace", str(workspace)])
-
-            self.assertEqual(submitted["invalidated"], ["design"])
-            self.assertTrue(status["can_advance"])
-            self.assertNotIn(
-                "design_requirement_mismatch",
-                {issue["type"] for issue in status["issues"]},
-            )
-            run_success(
-                [
-                    "review",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "2",
-                    "--outcome",
-                    "approved",
-                ]
-            )
-            after = run_success(["status", "--workspace", str(workspace)])
-            self.assertEqual(after["state"]["current_stage"], "design")
-            self.assertEqual(after["counts"]["accepted_requirements"], 1)
-
-    def test_stale_task_plan_and_tasks_do_not_block_analysis_approval(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            approve_analysis(workspace)
-            approve_design(workspace, ["REQ-001"])
-            approve_task_plan(
-                workspace,
-                [
-                    {
-                        "key": "drafts",
-                        "title": "Persist drafts",
-                        "requirements": ["REQ-001"],
-                        "depends_on": [],
-                    }
-                ],
-            )
-
-            submit_analysis_revision(workspace)
-            status = run_success(["status", "--workspace", str(workspace)])
-
-            self.assertTrue(status["can_advance"])
-            self.assertFalse(
-                {"design_requirement_mismatch", "task_reference_mismatch", "uncovered_requirements"}
-                & {issue["type"] for issue in status["issues"]}
-            )
-            run_success(
-                [
-                    "review",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "2",
-                    "--outcome",
-                    "approved",
-                ]
-            )
-
-    def test_review_content_drift_can_be_discarded_without_leaving_review(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            submit_analysis_for_review(workspace)
-            artifact_path = workspace / "artifacts/analysis.md"
-            recorded = "# Analysis\n\nUsers save drafts.\n"
-            artifact_path.write_text("# Edited during review\n", encoding="utf-8")
-
-            status = run_success(["status", "--workspace", str(workspace)])
-            issue = next(item for item in status["issues"] if item["type"] == "artifact_drift")
-            self.assertEqual(issue["recovery_action"], "resolve_review_drift")
-            self.assertEqual(issue["allowed_outcomes"], ["adopt", "discard"])
-
-            discarded = run_success(
-                [
-                    "resolve-drift",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "1",
-                    "--outcome",
-                    "discard",
-                ]
-            )
-
-            self.assertEqual(discarded["artifact_status"], "review")
-            self.assertEqual(artifact_path.read_text(encoding="utf-8"), recorded)
-            after = run_success(["status", "--workspace", str(workspace)])
-            self.assertEqual(after["state"]["mode"], "review")
-            self.assertTrue(after["can_advance"])
-
-    def test_review_content_drift_can_seed_a_successor_revision(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            submit_analysis_for_review(workspace)
-            artifact_path = workspace / "artifacts/analysis.md"
-            external = "# Analysis\n\nUsers save and restore drafts offline.\n"
-            artifact_path.write_text(external, encoding="utf-8")
-
-            adopted = run_success(
-                [
-                    "resolve-drift",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "1",
-                    "--outcome",
-                    "adopt",
-                    "--feedback",
-                    "Use the review edit as the next draft.",
-                ]
-            )
-
-            resumed = run_success(["prepare", "--workspace", str(workspace)])
-            self.assertEqual(resumed["work_id"], adopted["work_id"])
-            self.assertEqual(
-                (workspace / resumed["draft_output"]).read_text(encoding="utf-8"),
-                external,
-            )
-            self.assertEqual(
-                artifact_path.read_text(encoding="utf-8"),
-                "# Analysis\n\nUsers save drafts.\n",
-            )
-            submitted = run_success(
-                ["submit", "--workspace", str(workspace), "--work-id", resumed["work_id"]]
-            )
-            self.assertEqual(submitted["revision"], 2)
-
-    def test_structured_drift_reports_manual_repair(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            submit_analysis_for_review(workspace)
-            artifacts = json.loads(
-                (workspace / ".aiwf/artifacts.json").read_text(encoding="utf-8")
-            )
-            result_path = workspace / artifacts["items"][0]["result_path"]
-            result_path.write_text("{}\n", encoding="utf-8")
-
-            status = run_success(["status", "--workspace", str(workspace)])
-            issue = next(item for item in status["issues"] if item["type"] == "artifact_drift")
-            self.assertFalse(issue["recoverable"])
-            self.assertEqual(issue["allowed_outcomes"], [])
-            self.assertEqual(issue["recovery_action"], "manual_repair_required")
-
-    def test_changed_requested_drift_discard_preserves_active_revision_work(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            approve_analysis(workspace)
-            revision = run_success(
-                [
-                    "revise",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "1",
-                    "--feedback",
-                    "Clarify offline behavior.",
-                ]
-            )
-            active = run_success(["prepare", "--workspace", str(workspace)])
-            self.assertEqual(active["work_id"], revision["work_id"])
-            artifact_path = workspace / "artifacts/analysis.md"
-            recorded = artifact_path.read_text(encoding="utf-8")
-            artifact_path.write_text("# External edit while revising\n", encoding="utf-8")
-
-            discarded = run_success(
-                [
-                    "resolve-drift",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "1",
-                    "--outcome",
-                    "discard",
-                ]
-            )
-
-            self.assertEqual(discarded["artifact_status"], "changes_requested")
-            self.assertEqual(artifact_path.read_text(encoding="utf-8"), recorded)
-            resumed = run_success(["prepare", "--workspace", str(workspace)])
-            self.assertEqual(resumed["work_id"], active["work_id"])
-
-    def test_recover_command_resolves_an_incomplete_transaction(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            engine = WorkflowEngine(workspace)
-            original_state = engine.store.read_json("state.json")
-            changed_state = {**original_state, "updated_at": now_iso()}
-            with engine.store.lock(exclusive=True):
-                engine.store.inject_failure_after(1)
-                with self.assertRaises(InjectedTransactionFailure):
-                    engine.store.commit_locked(
-                        {".aiwf/state.json": json_bytes(changed_state)},
-                        event_type="test_change",
-                        event_data={},
-                        command_key="test:recover-cli",
-                        request_digest=sha256_bytes(b"recover-cli"),
-                    )
-
-            status = run_success(["status", "--workspace", str(workspace)])
-            self.assertEqual(status["status"], "needs_recovery")
-            recovered = run_success(["recover", "--workspace", str(workspace)])
-            self.assertEqual(recovered["status"], "recovered")
-            self.assertTrue(recovered["recovered"])
-            self.assertEqual(
-                run_success(["status", "--workspace", str(workspace)])["status"],
-                "ok",
-            )
-
-    def test_revise_command_resumes_an_approved_revision(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            approve_analysis(workspace)
-
-            revision_event = run_success(
-                [
-                    "revise",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "1",
-                    "--feedback",
-                    "Clarify offline behavior.",
-                ]
-            )
-            resumed = run_success(["prepare", "--workspace", str(workspace)])
-            self.assertEqual(resumed["work_id"], revision_event["work_id"])
-            self.assertEqual(resumed["stage"], "analysis")
-            self.assertEqual(resumed["feedback"], "Clarify offline behavior.")
-            editable_result = json.loads(
-                (workspace / resumed["result_output"]).read_text(encoding="utf-8")
-            )
-            self.assertNotIn("artifact_id", editable_result)
-            self.assertLessEqual(
-                set(editable_result),
-                set(resumed["result_schema"]["properties"]),
-            )
-
-    def test_external_artifact_content_can_be_adopted_as_a_revision(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            approve_analysis(workspace)
-            design = run_success(["prepare", "--workspace", str(workspace)])
-            write_outputs(
-                workspace,
-                design,
-                markdown="# Design\n\nPersist drafts.\n",
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            initial = engine.prepare_work()
+            submit_and_approve(
+                engine,
+                initial,
+                markdown="# Analysis\n\nSave drafts.\n",
                 result={
-                    "schema_version": 9,
-                    "stage": "design",
-                    "requirements": ["REQ-001"],
-                    "design_mode": "greenfield",
-                    "greenfield_reason": "The configured repository is empty.",
-                    "code_evidence": [],
-                    "memory_delta": [],
+                    "schema_version": 11,
+                    "stage": "analysis",
+                    "target_platform": "test",
+                    "requirements": [
+                        {
+                            "title": "Save drafts",
+                            "summary": "Persist drafts.",
+                            "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                            "platform_scope": "target",
+                            "change_type": "new",
+                            "scope_reason": "Core behavior.",
+                            "disposition": "proposed",
+                        }
+                    ],
+                    "withdrawn_requirements": [],
                 },
             )
-            run_success(
-                ["submit", "--workspace", str(workspace), "--work-id", design["work_id"]]
-            )
-            run_success(
-                [
-                    "review",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "design",
-                    "--revision",
-                    "1",
-                    "--outcome",
-                    "approved",
-                ]
-            )
-            artifact_path = workspace / "artifacts/analysis.md"
-            snapshot_path = workspace / ".aiwf/history/analysis/1.md"
-            approved_content = snapshot_path.read_text(encoding="utf-8")
-            external_content = "# Analysis\n\nUsers also resume drafts offline.\n"
-            artifact_path.write_text(external_content, encoding="utf-8")
-
-            adopted = run_success(
-                [
-                    "resolve-drift",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "1",
-                    "--outcome",
-                    "adopt",
-                    "--feedback",
-                    "Adopt the user-edited analysis.",
-                ]
+            revision = engine.request_revision("analysis", 1, feedback="Change retention.")
+            write_work_outputs(
+                engine,
+                revision,
+                markdown="# Analysis\n\nSave drafts.\n",
+                result={
+                    "schema_version": 11,
+                    "stage": "analysis",
+                    "target_platform": "test",
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "change_kind": "behavior",
+                            "title": "Save drafts",
+                            "summary": "Persist drafts for 30 days.",
+                            "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                            "platform_scope": "target",
+                            "change_type": "modify",
+                            "scope_reason": "Retention changed.",
+                            "disposition": "proposed",
+                        }
+                    ],
+                    "withdrawn_requirements": [],
+                },
             )
 
-            self.assertEqual(artifact_path.read_text(encoding="utf-8"), approved_content)
-            resumed = run_success(["prepare", "--workspace", str(workspace)])
-            self.assertEqual(resumed["work_id"], adopted["work_id"])
-            self.assertEqual(
-                (workspace / resumed["draft_output"]).read_text(encoding="utf-8"),
-                external_content,
-            )
-            submitted = run_success(
-                ["submit", "--workspace", str(workspace), "--work-id", resumed["work_id"]]
-            )
+            submitted = engine.submit_work(str(revision["work_id"]))
+
             self.assertEqual(submitted["revision"], 2)
-            self.assertEqual(submitted["invalidated"], ["design"])
-            self.assertEqual(snapshot_path.read_text(encoding="utf-8"), approved_content)
-            self.assertEqual(
-                (workspace / ".aiwf/history/analysis/2.md").read_text(encoding="utf-8"),
-                external_content,
-            )
 
-    def test_external_artifact_content_can_be_discarded(self) -> None:
+    def test_presentation_change_rejects_behavior_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            approve_analysis(workspace)
-            artifact_path = workspace / "artifacts/analysis.md"
-            snapshot_path = workspace / ".aiwf/history/analysis/1.md"
-            approved_content = snapshot_path.read_text(encoding="utf-8")
-            active = run_success(["prepare", "--workspace", str(workspace)])
-            artifact_path.write_text("# Accidental edit\n", encoding="utf-8")
-
-            conflict_arguments = [
-                "resolve-drift",
-                "--workspace",
-                str(workspace),
-                "--artifact-id",
-                "analysis",
-                "--revision",
-                "1",
-                "--outcome",
-                "discard",
-            ]
-            rejected = run_cli(conflict_arguments)
-            self.assertEqual(rejected.returncode, 6)
-            self.assertEqual(json.loads(rejected.stderr)["error"]["code"], "active_work_conflict")
-            discarded = run_success(
-                [*conflict_arguments, "--supersede-active-work"]
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            advance_to_tasks(
+                engine,
+                [{"key": "a", "title": "Task A", "requirements": ["REQ-001"], "depends_on": []}],
+            )
+            revision = engine.request_revision("analysis", 1, feedback="Change retention.")
+            write_work_outputs(
+                engine,
+                revision,
+                markdown="# Analysis\n\nRetain drafts for 60 days.\n",
+                result={
+                    "schema_version": 11,
+                    "stage": "analysis",
+                    "target_platform": "test",
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "change_kind": "presentation",
+                            "title": "Save drafts",
+                            "summary": "Persist and restore drafts for 60 days.",
+                            "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                            "platform_scope": "target",
+                            "change_type": "new",
+                            "scope_reason": "Retention changed.",
+                            "disposition": "proposed",
+                        }
+                    ],
+                    "withdrawn_requirements": [],
+                },
             )
 
-            self.assertEqual(discarded["outcome"], "discard")
-            self.assertEqual(artifact_path.read_text(encoding="utf-8"), approved_content)
-            self.assertEqual(run_success(["status", "--workspace", str(workspace)])["status"], "ok")
-            self.assertTrue(
-                (workspace / ".aiwf/history/abandoned" / active["work_id"] / "work.json").is_file()
-            )
+            with self.assertRaises(AIWorkflowError) as raised:
+                engine.submit_work(str(revision["work_id"]))
 
-            repeated = run_success([*conflict_arguments, "--supersede-active-work"])
-            self.assertEqual(repeated, discarded)
+            self.assertEqual(raised.exception.code, "invalid_change_kind")
 
-            artifact_path.write_text("# Another accidental edit\n", encoding="utf-8")
-            discarded_again = run_success(conflict_arguments)
-            self.assertEqual(discarded_again["outcome"], "discard")
-            self.assertEqual(artifact_path.read_text(encoding="utf-8"), approved_content)
-
-    def test_missing_artifact_content_can_only_be_discarded(self) -> None:
+    def test_withdrawing_task_abandons_only_that_tasks_active_work(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            approve_analysis(workspace)
-            artifact_path = workspace / "artifacts/analysis.md"
-            approved_content = (
-                workspace / ".aiwf/history/analysis/1.md"
-            ).read_text(encoding="utf-8")
-            artifact_path.unlink()
-
-            status = run_success(["status", "--workspace", str(workspace)])
-            issue = next(item for item in status["issues"] if item["type"] == "artifact_drift")
-            self.assertEqual(issue["allowed_outcomes"], ["discard"])
-
-            rejected = run_cli(
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            advance_to_tasks(
+                engine,
                 [
-                    "resolve-drift",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "1",
-                    "--outcome",
-                    "adopt",
-                    "--feedback",
-                    "Adopt deletion.",
-                ]
+                    {"key": "a", "title": "Task A", "requirements": ["REQ-001"], "depends_on": []},
+                    {"key": "b", "title": "Task B", "requirements": ["REQ-001"], "depends_on": []},
+                ],
             )
-            self.assertEqual(rejected.returncode, 7)
-            self.assertEqual(
-                json.loads(rejected.stderr)["error"]["code"],
-                "artifact_drift_unrecoverable",
-            )
-
-            discarded = run_success(
+            task_a = engine.prepare_work(active_item="T-001")
+            task_b = engine.prepare_work(active_item="T-002")
+            question = engine.open_questions(
+                str(task_a["work_id"]),
                 [
-                    "resolve-drift",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "1",
-                    "--outcome",
-                    "discard",
-                ]
-            )
-            self.assertIsNone(discarded["external_content_sha256"])
-            self.assertEqual(artifact_path.read_text(encoding="utf-8"), approved_content)
-
-    def test_structured_artifact_drift_cannot_be_adopted(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            approve_analysis(workspace)
-            artifacts = json.loads(
-                (workspace / ".aiwf/artifacts.json").read_text(encoding="utf-8")
-            )
-            result_path = workspace / artifacts["items"][0]["result_path"]
-            result_path.write_text("{}\n", encoding="utf-8")
-
-            rejected = run_cli(
-                [
-                    "resolve-drift",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "1",
-                    "--outcome",
-                    "adopt",
-                    "--feedback",
-                    "Adopt content.",
-                ]
-            )
-
-            self.assertEqual(rejected.returncode, 7)
-            self.assertEqual(
-                json.loads(rejected.stderr)["error"]["code"],
-                "artifact_drift_unrecoverable",
-            )
-
-    def test_approved_revision_does_not_replay_memory_additions(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            work = run_success(["prepare", "--workspace", str(workspace)])
-            (workspace / work["draft_output"]).write_text(
-                "# Analysis\n\nUsers save drafts.\n",
-                encoding="utf-8",
-            )
-            original_result = {
-                "schema_version": 9,
-                "stage": "analysis",
-                "target_platform": "web",
-                "requirements": [
                     {
-                        "title": "Save drafts",
-                        "summary": "Users save drafts.",
-                        "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
-                        "platform_scope": "target",
-                        "change_type": "new",
-                        "scope_reason": "Implemented by the web client.",
-                        "disposition": "proposed",
+                        "question": "Keep task A?",
+                        "reason": "The task may be removed.",
+                        "recommendation": "Remove it.",
                     }
                 ],
-                "memory_delta": [
-                    {
-                        "operation": "add",
-                        "type": "architecture_decision",
-                        "content": "Users save drafts.",
-                        "evidence": [],
-                        "rationale": "Confirmed by analysis.",
-                        "validation": None,
-                    }
+            )
+            revision = engine.request_revision("task-plan", 1, feedback="Remove task A.")
+            write_work_outputs(
+                engine,
+                revision,
+                markdown="# Tasks\n\nOnly task B remains.\n",
+                result={
+                    "schema_version": 11,
+                    "stage": "specification",
+                    "tasks": [],
+                    "withdrawn_tasks": ["T-001"],
+                },
+            )
+            submitted = engine.submit_work(str(revision["work_id"]))
+            engine.review_artifact("task-plan", int(submitted["revision"]), outcome="approved")
+
+            abandoned = engine.store.read_json_path(
+                f".aiwf/work/{task_a['work_id']}/work.json"
+            )
+            status = engine.inspect()
+
+            self.assertEqual(abandoned["status"], "abandoned")
+            self.assertNotIn(task_a["work_id"], {item["work_id"] for item in status["active_works"]})
+            self.assertIn(task_b["work_id"], {item["work_id"] for item in status["active_works"]})
+            cancelled = next(
+                item
+                for item in engine.store.read_json("questions.json")["items"]
+                if item["id"] == question["question_ids"][0]
+            )
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertEqual(status["counts"]["open_questions"], 0)
+
+    def test_task_plan_revision_accepts_structured_change_when_markdown_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            advance_to_tasks(
+                engine,
+                [{"key": "a", "title": "Task A", "requirements": ["REQ-001"], "depends_on": []}],
+            )
+            revision = engine.request_revision("task-plan", 1, feedback="Rename task A.")
+            write_work_outputs(
+                engine,
+                revision,
+                markdown="# Task plan\n\nIndependent task plan.\n",
+                result={
+                    "schema_version": 11,
+                    "stage": "specification",
+                    "tasks": [
+                        {
+                            "key": "a",
+                            "id": "T-001",
+                            "title": "Renamed task A",
+                            "requirements": ["REQ-001"],
+                            "depends_on": [],
+                        }
+                    ],
+                    "withdrawn_tasks": [],
+                },
+            )
+
+            submitted = engine.submit_work(str(revision["work_id"]))
+
+            self.assertEqual(submitted["revision"], 2)
+
+    def test_work_prepared_before_requirement_change_stays_pending_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            advance_to_tasks(
+                engine,
+                [{"key": "a", "title": "Task A", "requirements": ["REQ-001"], "depends_on": []}],
+            )
+            stale_spec = engine.prepare_work(active_item="T-001")
+
+            revision = engine.request_revision("analysis", 1, feedback="Change draft behavior.")
+            write_work_outputs(
+                engine,
+                revision,
+                markdown="# Analysis\n\nDrafts now expire.\n",
+                result={
+                    "schema_version": 11,
+                    "stage": "analysis",
+                    "target_platform": "test",
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "change_kind": "behavior",
+                            "title": "Save drafts",
+                            "summary": "Persist drafts for 30 days.",
+                            "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                            "platform_scope": "target",
+                            "change_type": "modify",
+                            "scope_reason": "Retention changed.",
+                            "disposition": "proposed",
+                        }
+                    ],
+                    "withdrawn_requirements": [],
+                },
+            )
+            submitted_analysis = engine.submit_work(str(revision["work_id"]))
+            engine.review_artifact(
+                "analysis", int(submitted_analysis["revision"]), outcome="approved"
+            )
+
+            write_work_outputs(
+                engine,
+                stale_spec,
+                markdown="# T-001 specification\n\nAcceptance: behavior is available.\n",
+                result={
+                    "schema_version": 11,
+                    "stage": "specification",
+                    "task_id": "T-001",
+                    "acceptance_criteria": ["Behavior is available"],
+                },
+            )
+            submitted_spec = engine.submit_work(str(stale_spec["work_id"]))
+            engine.review_artifact(
+                "T-001-spec", int(submitted_spec["revision"]), outcome="approved"
+            )
+
+            spec = next(
+                item
+                for item in engine.store.read_json("artifacts.json")["items"]
+                if item["id"] == "T-001-spec"
+            )
+            self.assertEqual(spec["needs_reconcile"], ["requirement:REQ-001"])
+
+    def test_newly_accepted_requirement_recommends_plan_without_blocking_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            advance_to_tasks(
+                engine,
+                [
+                    {"key": "a", "title": "Task A", "requirements": ["REQ-001"], "depends_on": []},
+                    {"key": "b", "title": "Task B", "requirements": ["REQ-001"], "depends_on": []},
                 ],
-            }
-            (workspace / work["result_output"]).write_text(
-                json.dumps(original_result),
-                encoding="utf-8",
-            )
-            run_success(
-                ["submit", "--workspace", str(workspace), "--work-id", work["work_id"]]
-            )
-            run_success(
-                [
-                    "review",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "1",
-                    "--outcome",
-                    "approved",
-                ]
             )
 
-            revision_event = run_success(
-                [
-                    "revise",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "1",
-                    "--feedback",
-                    "Clarify wording without changing the confirmed fact.",
-                ]
+            revision = engine.request_revision("analysis", 1, feedback="Add export support.")
+            write_work_outputs(
+                engine,
+                revision,
+                markdown="# Analysis\n\nDrafts and export.\n",
+                result={
+                    "schema_version": 11,
+                    "stage": "analysis",
+                    "target_platform": "test",
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "change_kind": "presentation",
+                            "title": "Save drafts",
+                            "summary": "Persist and restore drafts.",
+                            "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                            "platform_scope": "target",
+                            "change_type": "new",
+                            "scope_reason": "Core target behavior.",
+                            "disposition": "proposed",
+                        },
+                        {
+                            "title": "Export drafts",
+                            "summary": "Export a saved draft.",
+                            "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                            "platform_scope": "target",
+                            "change_type": "new",
+                            "scope_reason": "Newly approved behavior.",
+                            "disposition": "proposed",
+                        },
+                    ],
+                    "withdrawn_requirements": [],
+                },
             )
-            revised = run_success(["prepare", "--workspace", str(workspace)])
-            self.assertEqual(revised["work_id"], revision_event["work_id"])
-            seed = json.loads(
-                (workspace / revised["result_output"]).read_text(encoding="utf-8")
-            )
-            self.assertEqual(seed["memory_delta"], [])
-            self.assertNotIn("origin_revision", seed["requirements"][0])
-            self.assertEqual(
-                revised["facts"]["affected_memory"][0]["id"],
-                "M-001",
-            )
-            unchanged = run_cli(
-                [
-                    "submit",
-                    "--workspace",
-                    str(workspace),
-                    "--work-id",
-                    revised["work_id"],
-                ]
-            )
-            self.assertEqual(unchanged.returncode, 4)
-            self.assertEqual(
-                json.loads(unchanged.stderr)["error"]["code"],
-                "revision_has_no_changes",
-            )
-            (workspace / revised["draft_output"]).write_text(
-                "# Analysis\n\nUsers can save drafts.\n",
-                encoding="utf-8",
+            submitted = engine.submit_work(str(revision["work_id"]))
+            approved = engine.review_artifact(
+                "analysis", int(submitted["revision"]), outcome="approved"
             )
 
-            run_success(
-                [
-                    "submit",
-                    "--workspace",
-                    str(workspace),
-                    "--work-id",
-                    revised["work_id"],
-                ]
-            )
-            run_success(
-                [
-                    "review",
-                    "--workspace",
-                    str(workspace),
-                    "--artifact-id",
-                    "analysis",
-                    "--revision",
-                    "2",
-                    "--outcome",
-                    "approved",
-                ]
-            )
-            memory = json.loads(
-                (workspace / ".aiwf/memory.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual([item["id"] for item in memory["items"]], ["M-001"])
+            status = engine.inspect()
+            self.assertEqual(approved["needs_reconcile"], ["task-plan"])
+            self.assertEqual(status["recommended_work"]["artifact_id"], "task-plan")
+            self.assertEqual(status["next_action"], "plan_tasks")
+            unrelated = engine.prepare_work(active_item="T-002")
+            self.assertEqual(unrelated["stage"], "specification")
 
-    def test_revise_requires_confirmation_and_archives_superseded_work(self) -> None:
+    def test_requirement_change_marks_only_related_task_and_real_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            approve_analysis(workspace)
-            active = run_success(["prepare", "--workspace", str(workspace)])
-            (workspace / active["draft_output"]).write_text(
-                "# Unfinished design\n", encoding="utf-8"
-            )
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            advance_two_requirements(engine)
+            for task_id in ("T-001", "T-002", "T-003"):
+                approve_task_spec(engine, task_id)
+            approve_task_implementation(engine, "T-001")
 
-            arguments = [
-                "revise",
-                "--workspace",
-                str(workspace),
-                "--artifact-id",
-                "analysis",
-                "--revision",
-                "1",
-                "--feedback",
-                "Change the approved requirement.",
-            ]
-            rejected = run_cli(arguments)
-            self.assertNotEqual(rejected.returncode, 0)
-            self.assertEqual(json.loads(rejected.stderr)["error"]["code"], "active_work_conflict")
-
-            revised = run_success([*arguments, "--supersede-active-work"])
-            archive = workspace / ".aiwf/history/abandoned" / active["work_id"]
-            self.assertEqual(
-                (archive / "artifact.md").read_text(encoding="utf-8"),
-                "# Unfinished design\n",
+            revision = engine.request_revision("analysis", 1, feedback="Draft retention changed.")
+            write_work_outputs(
+                engine,
+                revision,
+                markdown="# Analysis\n\nDraft retention is now 60 days.\n",
+                result={
+                    "schema_version": 11,
+                    "stage": "analysis",
+                    "target_platform": "test",
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "change_kind": "behavior",
+                            "title": "Drafts",
+                            "summary": "Persist drafts for 60 days.",
+                            "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                            "platform_scope": "target",
+                            "change_type": "modify",
+                            "scope_reason": "Confirmed retention change.",
+                            "disposition": "proposed",
+                        }
+                    ],
+                    "withdrawn_requirements": [],
+                },
             )
-            self.assertEqual(
-                json.loads((archive / "work.json").read_text(encoding="utf-8"))["status"],
-                "abandoned",
-            )
-            self.assertNotEqual(revised["work_id"], active["work_id"])
+            submitted = engine.submit_work(str(revision["work_id"]))
+            approved = engine.review_artifact("analysis", int(submitted["revision"]), outcome="approved")
+            self.assertIn("T-001-implementation", approved["needs_reconcile"])
+            self.assertNotIn("T-002-spec", approved["needs_reconcile"])
 
-    def test_memory_projection_drift_blocks_prepare_and_is_rebuilt_by_recover(self) -> None:
+            by_id = {item["id"]: item for item in engine.store.read_json("artifacts.json")["items"]}
+            self.assertTrue(by_id["T-001-spec"]["needs_reconcile"])
+            self.assertFalse(by_id["T-002-spec"]["needs_reconcile"])
+            with self.assertRaises(AIWorkflowError) as blocked:
+                engine.prepare_work(active_item="T-002")
+            self.assertEqual(blocked.exception.code, "task_dependency_blocked")
+            unrelated = engine.prepare_work(active_item="T-003")
+            self.assertEqual(unrelated["stage"], "implementation")
+
+            engine.reconcile_artifact("T-001-spec", 1, "Specification still covers the changed retention.")
+            engine.reconcile_artifact("T-001-implementation", 1, "Current implementation already supports 60 days.")
+            dependent = engine.prepare_work(active_item="T-002")
+            self.assertEqual(dependent["stage"], "implementation")
+
+    def test_manual_markdown_edit_is_used_as_revision_draft_without_global_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            workspace = initialize_workspace(Path(directory))
-            memory_path = workspace / ".aiwf/memory.md"
-            memory_path.write_text("tampered\n", encoding="utf-8")
-
-            status = run_success(["status", "--workspace", str(workspace)])
-            self.assertEqual(status["status"], "issues_found")
-            issue = next(
-                item for item in status["issues"] if item["type"] == "generated_view_drift"
-            )
-            self.assertTrue(issue["blocking"])
-            self.assertEqual(issue["recovery_action"], "recover")
-
-            blocked = run_cli(["prepare", "--workspace", str(workspace)])
-            self.assertEqual(blocked.returncode, 7)
-            self.assertEqual(
-                json.loads(blocked.stderr)["error"]["code"],
-                "workspace_health_blocked",
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            advance_two_requirements(engine)
+            approve_task_spec(engine, "T-003")
+            (workspace / "artifacts/analysis.md").write_text(
+                "# Analysis\n\nHuman-edited wording.\n", encoding="utf-8"
             )
 
-            run_success(["recover", "--workspace", str(workspace)])
-            self.assertIn("Current Decisions", memory_path.read_text(encoding="utf-8"))
+            task_work = engine.prepare_work(active_item="T-003")
+            revision = engine.request_revision("analysis", 1, feedback="Adopt the wording.")
+
+            self.assertEqual(task_work["stage"], "implementation")
+            self.assertIn(
+                "Human-edited wording",
+                (workspace / str(revision["draft_output"])).read_text(encoding="utf-8"),
+            )
+            self.assertEqual(engine.inspect()["counts"]["active_works"], 2)
 
 
 if __name__ == "__main__":

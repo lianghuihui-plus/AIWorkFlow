@@ -1,22 +1,19 @@
-"""Artifact paths, result manifests, indexes, and dependency invalidation."""
+"""Artifact paths, result manifests, indexes, and revision semantics."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 from .model import (
     AIWorkflowError,
     ID_PATTERNS,
-    MEMORY_OPERATIONS,
-    MEMORY_TYPES,
     SCHEMA_VERSION,
     SOURCE_KINDS,
     fail_schema,
     next_id,
-    require_evidence_list,
     require_list,
     require_mapping,
     require_optional_string,
@@ -27,17 +24,82 @@ from .model import (
 )
 
 
+def semantic_digest(value: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return sha256_content(payload)
+
+
+def requirement_semantic_value(item: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: item.get(key)
+        for key in ("summary", "platform_scope", "change_type", "disposition")
+    }
+
+
+def requirement_content_value(item: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        **requirement_semantic_value(item),
+        "title": item.get("title"),
+        "sources": item.get("sources", []),
+        "scope_reason": item.get("scope_reason"),
+    }
+
+
+def task_semantic_value(item: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: item.get(key)
+        for key in ("requirements", "depends_on", "status")
+    }
+
+
+def task_content_value(item: Mapping[str, Any]) -> dict[str, Any]:
+    return {**task_semantic_value(item), "title": item.get("title")}
+
+
 def sha256_content(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
 def semantic_result_hash(result: dict[str, Any]) -> str:
+    stage = result["stage"]
     semantic = result_seed_from_record(
-        result["stage"],
+        stage,
         result,
-        preserve_memory_delta=False,
     )
-    semantic.pop("memory_delta", None)
+    if stage == "analysis" and isinstance(result.get("effective_requirements"), list):
+        semantic["requirements"] = sorted(
+            (
+                {
+                    "id": item.get("id"),
+                    **requirement_content_value(item),
+                    "disposition": (
+                        "accepted"
+                        if item.get("disposition") == "proposed"
+                        else item.get("disposition")
+                    ),
+                }
+                for item in result["effective_requirements"]
+            ),
+            key=lambda item: str(item["id"]),
+        )
+    elif (
+        stage == "specification"
+        and result.get("task_id") is None
+        and isinstance(result.get("effective_tasks"), list)
+    ):
+        semantic["tasks"] = sorted(
+            (
+                {
+                    "id": item.get("id"),
+                    **task_content_value(item),
+                    "status": "active" if item.get("status") == "proposed" else item.get("status"),
+                }
+                for item in result["effective_tasks"]
+            ),
+            key=lambda item: str(item["id"]),
+        )
     payload = json.dumps(
         semantic,
         ensure_ascii=False,
@@ -77,6 +139,14 @@ def artifact_identity(stage: str, active_item: str | None) -> tuple[str, str, st
     )
 
 
+def artifact_revision_paths(artifact_id: str, revision: int) -> dict[str, str]:
+    return {
+        "snapshot_path": f".aiwf/history/{artifact_id}/{revision}.md",
+        "result_path": f".aiwf/results/{artifact_id}/{revision}.json",
+        "work_path": f".aiwf/history/{artifact_id}/{revision}.work.json",
+    }
+
+
 def result_schema(stage: str, active_item: str | None = None) -> dict[str, Any]:
     string = {"type": "string", "minLength": 1}
     string_array = {"type": "array", "items": string, "uniqueItems": True}
@@ -93,69 +163,15 @@ def result_schema(stage: str, active_item: str | None = None) -> dict[str, Any]:
             "additionalProperties": False,
         },
     }
-    evidence_array = {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "required": ["path", "symbol"],
-            "properties": {"path": string, "symbol": string},
-            "additionalProperties": False,
-        },
-    }
-    memory_delta = {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "required": [
-                "operation",
-                "type",
-                "content",
-                "evidence",
-                "rationale",
-                "validation",
-            ],
-            "properties": {
-                "operation": {"enum": list(MEMORY_OPERATIONS)},
-                "type": {"enum": list(MEMORY_TYPES)},
-                "content": string,
-                "evidence": evidence_array,
-                "rationale": {"type": ["string", "null"]},
-                "validation": {"type": ["string", "null"]},
-                "target_id": {"type": ["string", "null"], "pattern": r"^M-\d{3,}$"},
-            },
-            "allOf": [
-                {
-                    "if": {
-                        "properties": {"operation": {"const": "add"}},
-                        "required": ["operation"],
-                    },
-                    "then": {"properties": {"target_id": {"type": "null"}}},
-                    "else": {
-                        "required": ["target_id"],
-                        "properties": {
-                            "target_id": {
-                                "type": "string",
-                                "pattern": r"^M-\d{3,}$",
-                            }
-                        },
-                    },
-                }
-            ],
-            "additionalProperties": False,
-        },
-    }
     properties: dict[str, Any] = {
         "schema_version": {"const": SCHEMA_VERSION},
         "stage": {"const": stage},
-        "memory_delta": memory_delta,
-        "superseded_decisions": string_array,
     }
-    required = ["schema_version", "stage", "memory_delta"]
+    required = ["schema_version", "stage"]
     if stage == "analysis":
         properties["target_platform"] = string
         properties["requirements"] = {
             "type": "array",
-            "minItems": 1,
             "items": {
                 "type": "object",
                 "required": [
@@ -169,6 +185,7 @@ def result_schema(stage: str, active_item: str | None = None) -> dict[str, Any]:
                 ],
                 "properties": {
                     "id": {"type": ["string", "null"], "pattern": r"^REQ-\d{3,}$"},
+                    "change_kind": {"enum": ["behavior", "presentation"]},
                     "title": string,
                     "summary": string,
                     "sources": source_array,
@@ -180,6 +197,7 @@ def result_schema(stage: str, active_item: str | None = None) -> dict[str, Any]:
                 "additionalProperties": False,
             },
         }
+        properties["withdrawn_requirements"] = string_array
         required.extend(("target_platform", "requirements"))
     elif stage == "design":
         properties["requirements"] = {**string_array, "minItems": 1}
@@ -204,7 +222,6 @@ def result_schema(stage: str, active_item: str | None = None) -> dict[str, Any]:
     elif stage == "specification" and active_item is None:
         properties["tasks"] = {
             "type": "array",
-            "minItems": 1,
             "items": {
                 "type": "object",
                 "required": ["key", "title", "requirements", "depends_on"],
@@ -218,38 +235,51 @@ def result_schema(stage: str, active_item: str | None = None) -> dict[str, Any]:
                 "additionalProperties": False,
             },
         }
+        properties["withdrawn_tasks"] = string_array
         required.append("tasks")
     elif stage == "specification":
         properties["task_id"] = {"type": "string", "pattern": r"^T-\d{3,}$"}
-        required.append("task_id")
+        properties["acceptance_criteria"] = {**string_array, "minItems": 1}
+        required.extend(("task_id", "acceptance_criteria"))
     elif stage == "implementation":
         properties.update(
             {
                 "task_id": {"type": "string", "pattern": r"^T-\d{3,}$"},
+                "summary": string,
                 "changed_files": string_array,
-                "validation_summary": {"type": "string"},
+                "acceptance_results": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "required": ["criterion", "status", "evidence"],
+                        "properties": {
+                            "criterion": string,
+                            "status": {"enum": ["passed", "failed"]},
+                            "evidence": string,
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "validation": {**string_array, "minItems": 1},
+                "risks": string_array,
             }
         )
-        required.extend(("task_id", "changed_files", "validation_summary"))
+        required.extend(
+            ("task_id", "summary", "changed_files", "acceptance_results", "validation", "risks")
+        )
     elif stage == "testing":
         properties.update(
             {
                 "task_id": {"type": "string", "pattern": r"^T-\d{3,}$"},
+                "status": {"enum": ["completed", "failed", "skipped"]},
                 "test_files": string_array,
-                "execution": {
-                    "type": "object",
-                    "required": ["command", "exit_code", "summary"],
-                    "properties": {
-                        "command": {"type": ["string", "null"]},
-                        "exit_code": {"type": ["integer", "null"]},
-                        "summary": {"type": "string"},
-                    },
-                    "additionalProperties": False,
-                },
+                "command": {"type": ["string", "null"]},
+                "summary": string,
                 "uncovered": string_array,
             }
         )
-        required.extend(("task_id", "test_files", "execution", "uncovered"))
+        required.extend(("task_id", "status", "test_files", "command", "summary", "uncovered"))
     else:
         raise AIWorkflowError(
             code="invalid_stage",
@@ -269,12 +299,11 @@ def result_seed(stage: str, active_item: str | None) -> dict[str, Any]:
     seed: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "stage": stage,
-        "memory_delta": [],
-        "superseded_decisions": [],
     }
     if stage == "analysis":
         seed["target_platform"] = ""
         seed["requirements"] = []
+        seed["withdrawn_requirements"] = []
     elif stage == "design":
         seed["requirements"] = []
         seed["design_mode"] = "anchored"
@@ -282,18 +311,29 @@ def result_seed(stage: str, active_item: str | None) -> dict[str, Any]:
         seed["code_evidence"] = []
     elif stage == "specification" and active_item is None:
         seed["tasks"] = []
+        seed["withdrawn_tasks"] = []
     elif stage == "specification":
         seed["task_id"] = active_item
+        seed["acceptance_criteria"] = []
     elif stage == "implementation":
         seed.update(
-            {"task_id": active_item, "changed_files": [], "validation_summary": ""}
+            {
+                "task_id": active_item,
+                "summary": "",
+                "changed_files": [],
+                "acceptance_results": [],
+                "validation": [],
+                "risks": [],
+            }
         )
     elif stage == "testing":
         seed.update(
             {
                 "task_id": active_item,
+                "status": "completed",
                 "test_files": [],
-                "execution": {"command": None, "exit_code": None, "summary": ""},
+                "command": None,
+                "summary": "",
                 "uncovered": [],
             }
         )
@@ -306,41 +346,35 @@ def result_seed_from_record(
     stage: str,
     record: dict[str, Any],
     *,
-    preserve_memory_delta: bool,
     active_item: str | None = None,
 ) -> dict[str, Any]:
     resolved_active_item = active_item if active_item is not None else record.get("task_id")
     seed = _project_schema_fields(record, result_schema(stage, resolved_active_item))
     if stage == "analysis":
-        for requirement in seed.get("requirements", []):
-            for source in requirement.get("sources", []):
-                if source.get("kind") == "agent_inference":
-                    source["ref"] = "self"
-    if not preserve_memory_delta:
-        seed["memory_delta"] = []
-        seed["superseded_decisions"] = []
+        seed["requirements"] = []
+        seed["withdrawn_requirements"] = []
+    elif stage == "specification" and resolved_active_item is None:
+        seed["tasks"] = []
+        seed["withdrawn_tasks"] = []
     return seed
 
 
 def validate_result_manifest(stage: str, value: Any, *, active_item: str | None) -> dict[str, Any]:
     document = f"{stage} result manifest"
-    data = require_mapping(value, document)
+    data = dict(require_mapping(value, document))
     _validate_closed_shape(data, result_schema(stage, active_item), document, path="$")
     if data.get("schema_version") != SCHEMA_VERSION:
         fail_schema(document, "unsupported schema_version")
     if data.get("stage") != stage:
         fail_schema(document, f"stage must be '{stage}'")
-    _validate_memory_delta(data.get("memory_delta"), document)
-    if "superseded_decisions" in data:
-        superseded = require_string_list(
-            data.get("superseded_decisions"), document, "superseded_decisions"
-        )
-        if any(not ID_PATTERNS["decision"].fullmatch(item) for item in superseded):
-            fail_schema(document, "superseded_decisions must contain decision ids")
-
     if stage == "analysis":
         require_string(data.get("target_platform"), document, "target_platform")
         _validate_requirement_results(data.get("requirements"), document)
+        require_string_list(
+            data.get("withdrawn_requirements", []),
+            document,
+            "withdrawn_requirements",
+        )
     elif stage == "design":
         require_string_list(data.get("requirements"), document, "requirements")
         if data.get("design_mode") not in {"anchored", "greenfield"}:
@@ -355,23 +389,43 @@ def validate_result_manifest(stage: str, value: Any, *, active_item: str | None)
             fail_schema(document, "greenfield design requires greenfield_reason")
     elif stage == "specification" and active_item is None:
         _validate_task_results(data.get("tasks"), document)
+        require_string_list(data.get("withdrawn_tasks", []), document, "withdrawn_tasks")
     elif stage == "specification":
         _validate_task_id(data.get("task_id"), active_item, document)
+        require_string_list(data.get("acceptance_criteria"), document, "acceptance_criteria")
     elif stage == "implementation":
         _validate_task_id(data.get("task_id"), active_item, document)
+        require_string(data.get("summary"), document, "summary")
         require_string_list(data.get("changed_files"), document, "changed_files")
-        require_string(data.get("validation_summary"), document, "validation_summary", empty=True)
+        acceptance = require_list(data.get("acceptance_results"), document, "acceptance_results")
+        if not acceptance:
+            fail_schema(document, "acceptance_results must contain at least one criterion")
+        for raw_item in acceptance:
+            item = require_mapping(raw_item, document)
+            require_string(item.get("criterion"), document, "acceptance criterion")
+            require_string(item.get("evidence"), document, "acceptance evidence")
+            if item.get("status") not in {"passed", "failed"}:
+                fail_schema(document, "acceptance status must be passed or failed")
+        if any(item["status"] != "passed" for item in acceptance):
+            raise AIWorkflowError(
+                code="acceptance_not_met",
+                message="Implementation cannot complete while acceptance criteria are unmet.",
+                exit_code=4,
+                details={
+                    "criteria": [item["criterion"] for item in acceptance if item["status"] != "passed"]
+                },
+            )
+        require_string_list(data.get("validation"), document, "validation")
+        require_string_list(data.get("risks"), document, "risks")
     elif stage == "testing":
         _validate_task_id(data.get("task_id"), active_item, document)
+        if data.get("status") not in {"completed", "failed", "skipped"}:
+            fail_schema(document, "testing status must be completed, failed, or skipped")
         require_string_list(data.get("test_files"), document, "test_files")
-        execution = require_mapping(data.get("execution"), document)
-        command = execution.get("command")
+        command = data.get("command")
         if command is not None and not isinstance(command, str):
-            fail_schema(document, "execution.command must be a string or null")
-        exit_code = execution.get("exit_code")
-        if exit_code is not None and type(exit_code) is not int:
-            fail_schema(document, "execution.exit_code must be an integer or null")
-        require_string(execution.get("summary"), document, "execution.summary", empty=True)
+            fail_schema(document, "command must be a string or null")
+        require_string(data.get("summary"), document, "summary")
         require_string_list(data.get("uncovered"), document, "uncovered")
     else:
         fail_schema(document, f"unsupported stage '{stage}'")
@@ -388,6 +442,15 @@ def reconcile_requirements(
     used_ids: set[str] = set()
     normalized_results: list[dict[str, Any]] = []
     known_ids = list(existing)
+    withdrawn_ids = set(result.get("withdrawn_requirements", []))
+    unknown_withdrawals = sorted(withdrawn_ids - set(existing))
+    if unknown_withdrawals:
+        raise AIWorkflowError(
+            code="unknown_requirement_id",
+            message="Requirement withdrawal references an unknown requirement.",
+            exit_code=4,
+            details={"ids": unknown_withdrawals},
+        )
 
     for raw_item in result["requirements"]:
         item = dict(raw_item)
@@ -396,11 +459,30 @@ def reconcile_requirements(
             item_id = next_id("requirement", known_ids)
             known_ids.append(item_id)
         elif item_id not in existing:
-            raise AIWorkflowError(
-                code="unknown_requirement_id",
-                message="Existing requirement ids must be provided by prepare.",
-                exit_code=4,
-                details={"id": item_id},
+            if not (
+                type(item.get("revision")) is int
+                and item["revision"] >= 1
+                and type(item.get("origin_revision")) is int
+                and item.get("approved_revision") is None
+            ):
+                raise AIWorkflowError(
+                    code="unknown_requirement_id",
+                    message="Existing requirement ids must be provided by prepare.",
+                    exit_code=4,
+                    details={"id": item_id},
+                )
+            known_ids.append(item_id)
+        previous = existing.get(item_id)
+        change_kind = item.get("change_kind")
+        if previous is not None and change_kind not in {"behavior", "presentation"}:
+            fail_schema(
+                "analysis result manifest",
+                "existing requirement changes require change_kind behavior or presentation",
+            )
+        if previous is None and change_kind is not None:
+            fail_schema(
+                "analysis result manifest",
+                "change_kind is only valid for an existing requirement",
             )
         if item_id in used_ids:
             raise AIWorkflowError(
@@ -421,15 +503,67 @@ def reconcile_requirements(
             "scope_reason": item["scope_reason"],
             "origin_revision": revision,
         }
+        revision_fields = _unit_revision_fields(
+            previous,
+            normalized,
+            semantic_value=requirement_semantic_value,
+            content_value=requirement_content_value,
+        )
+        if previous is not None and change_kind == "presentation":
+            candidate_semantic = requirement_semantic_value(normalized)
+            if candidate_semantic["disposition"] == "proposed":
+                candidate_semantic["disposition"] = "accepted"
+            if candidate_semantic != requirement_semantic_value(previous):
+                raise AIWorkflowError(
+                    code="invalid_change_kind",
+                    message="Presentation changes cannot modify requirement behavior fields.",
+                    exit_code=4,
+                    details={"id": item_id},
+                )
+            revision_fields["semantic_sha256"] = previous["semantic_sha256"]
+        else:
+            effective_semantic = requirement_semantic_value(normalized)
+            if effective_semantic["disposition"] == "proposed":
+                effective_semantic["disposition"] = "accepted"
+            revision_fields["semantic_sha256"] = semantic_digest(effective_semantic)
+        normalized.update(revision_fields)
         existing[item_id] = normalized
-        normalized_results.append(dict(normalized))
+        normalized_result = dict(normalized)
+        if change_kind is not None:
+            normalized_result["change_kind"] = change_kind
+        normalized_results.append(normalized_result)
 
-    for item_id, item in existing.items():
-        if item_id not in used_ids:
-            item["disposition"] = "withdrawn"
+    overlap = sorted(used_ids.intersection(withdrawn_ids))
+    if overlap:
+        raise AIWorkflowError(
+            code="requirement_patch_conflict",
+            message="A requirement cannot be updated and withdrawn in the same revision.",
+            exit_code=4,
+            details={"ids": overlap},
+        )
+    for item_id in withdrawn_ids:
+        item = existing[item_id]
+        withdrawn = {**item, "disposition": "withdrawn", "origin_revision": revision}
+        withdrawn.update(
+            _unit_revision_fields(
+                item,
+                withdrawn,
+                semantic_value=requirement_semantic_value,
+                content_value=requirement_content_value,
+            )
+        )
+        existing[item_id] = withdrawn
+
+    if not existing:
+        raise AIWorkflowError(
+            code="empty_requirements",
+            message="Analysis must establish at least one requirement before submission.",
+            exit_code=4,
+        )
 
     normalized_manifest = dict(result)
     normalized_manifest["requirements"] = normalized_results
+    normalized_manifest["withdrawn_requirements"] = sorted(withdrawn_ids)
     index = {"schema_version": SCHEMA_VERSION, "items": sorted(existing.values(), key=lambda item: item["id"])}
     return index, normalized_manifest
 
@@ -471,6 +605,15 @@ def reconcile_tasks(
     known_ids = list(existing)
     used_ids: set[str] = set()
     key_to_id: dict[str, str] = {}
+    withdrawn_ids = set(result.get("withdrawn_tasks", []))
+    unknown_withdrawals = sorted(withdrawn_ids - set(existing))
+    if unknown_withdrawals:
+        raise AIWorkflowError(
+            code="unknown_task_id",
+            message="Task withdrawal references an unknown task.",
+            exit_code=4,
+            details={"ids": unknown_withdrawals},
+        )
 
     for raw_item in result["tasks"]:
         item_id = raw_item.get("id")
@@ -478,12 +621,19 @@ def reconcile_tasks(
             item_id = next_id("task", known_ids)
             known_ids.append(item_id)
         elif item_id not in existing:
-            raise AIWorkflowError(
-                code="unknown_task_id",
-                message="Existing task ids must be provided by prepare.",
-                exit_code=4,
-                details={"id": item_id},
-            )
+            if not (
+                type(raw_item.get("revision")) is int
+                and raw_item["revision"] >= 1
+                and type(raw_item.get("origin_revision")) is int
+                and raw_item.get("approved_revision") is None
+            ):
+                raise AIWorkflowError(
+                    code="unknown_task_id",
+                    message="Existing task ids must be provided by prepare.",
+                    exit_code=4,
+                    details={"id": item_id},
+                )
+            known_ids.append(item_id)
         if item_id in used_ids:
             raise AIWorkflowError(
                 code="duplicate_task_id",
@@ -510,7 +660,7 @@ def reconcile_tasks(
         dependencies: list[str] = []
         for dependency in raw_item["depends_on"]:
             dependency_id = key_to_id.get(dependency, dependency)
-            if dependency_id not in used_ids:
+            if dependency_id not in set(existing).union(used_ids):
                 raise AIWorkflowError(
                     code="unknown_task_dependency",
                     message="Task dependency must remain active in the current task-plan revision.",
@@ -526,9 +676,55 @@ def reconcile_tasks(
             "status": "proposed",
             "origin_revision": revision,
         }
+        normalized.update(
+            _unit_revision_fields(
+                existing.get(item_id),
+                normalized,
+                semantic_value=task_semantic_value,
+                content_value=task_content_value,
+            )
+        )
         existing[item_id] = normalized
         normalized_results.append({**normalized, "key": raw_item["key"]})
 
+    overlap = sorted(used_ids.intersection(withdrawn_ids))
+    if overlap:
+        raise AIWorkflowError(
+            code="task_patch_conflict",
+            message="A task cannot be updated and withdrawn in the same revision.",
+            exit_code=4,
+            details={"ids": overlap},
+        )
+    for item_id in withdrawn_ids:
+        item = existing[item_id]
+        withdrawn = {**item, "status": "withdrawn", "origin_revision": revision}
+        withdrawn.update(
+            _unit_revision_fields(
+                item,
+                withdrawn,
+                semantic_value=task_semantic_value,
+                content_value=task_content_value,
+            )
+        )
+        existing[item_id] = withdrawn
+
+    for item in existing.values():
+        if item["status"] != "withdrawn" and any(
+            dependency in withdrawn_ids for dependency in item["depends_on"]
+        ):
+            raise AIWorkflowError(
+                code="unknown_task_dependency",
+                message="Active tasks cannot depend on a withdrawn task.",
+                exit_code=4,
+                details={"id": item["id"]},
+            )
+
+    covered_requirements = {
+        requirement_id
+        for item in existing.values()
+        if item["status"] != "withdrawn"
+        for requirement_id in item["requirements"]
+    }
     uncovered_requirements = sorted(requirement_ids - covered_requirements)
     if uncovered_requirements:
         raise AIWorkflowError(
@@ -538,15 +734,41 @@ def reconcile_tasks(
             details={"ids": uncovered_requirements},
         )
 
-    for item_id, item in existing.items():
-        if item_id not in used_ids:
-            item["status"] = "withdrawn"
     validate_task_dependency_graph(existing)
 
     normalized_manifest = dict(result)
     normalized_manifest["tasks"] = normalized_results
+    normalized_manifest["withdrawn_tasks"] = sorted(withdrawn_ids)
     index = {"schema_version": SCHEMA_VERSION, "items": sorted(existing.values(), key=lambda item: item["id"])}
     return index, normalized_manifest
+
+
+def _unit_revision_fields(
+    previous: Mapping[str, Any] | None,
+    current: Mapping[str, Any],
+    *,
+    semantic_value: Any,
+    content_value: Any,
+) -> dict[str, Any]:
+    semantic_sha256 = semantic_digest(semantic_value(current))
+    content_sha256 = semantic_digest(content_value(current))
+    if previous is None:
+        revision = 1
+        approved_revision = None
+    else:
+        previous_content = previous.get("content_sha256")
+        if previous_content is None:
+            previous_content = semantic_digest(content_value(previous))
+        revision = int(previous.get("revision", 1))
+        if previous_content != content_sha256:
+            revision += 1
+        approved_revision = previous.get("approved_revision", previous.get("revision", 1))
+    return {
+        "revision": revision,
+        "approved_revision": approved_revision,
+        "semantic_sha256": semantic_sha256,
+        "content_sha256": content_sha256,
+    }
 
 
 def find_artifact(artifacts: dict[str, Any], artifact_id: str) -> dict[str, Any] | None:
@@ -560,67 +782,8 @@ def replace_artifact(artifacts: dict[str, Any], artifact: dict[str, Any]) -> dic
     return {"schema_version": SCHEMA_VERSION, "items": items}
 
 
-def invalidate_downstream(
-    artifacts: dict[str, Any],
-    *,
-    artifact_id: str,
-    revision: int,
-) -> tuple[dict[str, Any], list[str]]:
-    items = [dict(item) for item in artifacts["items"]]
-    invalidated: list[str] = []
-    frontier = {f"{artifact_id}@{revision}"}
-    while frontier:
-        next_frontier: set[str] = set()
-        for item in items:
-            if item["id"] == artifact_id or item["status"] == "stale":
-                continue
-            if frontier.intersection(item["depends_on"]):
-                item["status"] = "stale"
-                invalidated.append(item["id"])
-                next_frontier.add(f"{item['id']}@{item['revision']}")
-        frontier = next_frontier
-    return {"schema_version": SCHEMA_VERSION, "items": items}, invalidated
-
-
-def artifact_integrity_issues(root: Path, artifact: dict[str, Any]) -> list[dict[str, str]]:
-    checks = (
-        ("content", artifact["path"], artifact["content_sha256"]),
-        ("snapshot", artifact["snapshot_path"], artifact["content_sha256"]),
-        ("result", artifact["result_path"], artifact["result_sha256"]),
-        ("work", artifact["work_path"], artifact["work_sha256"]),
-    )
-    issues: list[dict[str, str]] = []
-    for component, relative_path, expected_hash in checks:
-        relative = Path(relative_path)
-        path = (root / relative).resolve(strict=False)
-        if relative.is_absolute() or ".." in relative.parts or not path.is_relative_to(root.resolve()):
-            issues.append({"component": component, "path": relative_path, "reason": "outside"})
-            continue
-        try:
-            actual_hash = sha256_content(path.read_bytes())
-        except OSError:
-            issues.append({"component": component, "path": relative_path, "reason": "missing"})
-            continue
-        if actual_hash != expected_hash:
-            issues.append({"component": component, "path": relative_path, "reason": "changed"})
-    return issues
-
-
-def verify_artifact_integrity(root: Path, artifact: dict[str, Any]) -> None:
-    issues = artifact_integrity_issues(root, artifact)
-    if issues:
-        raise AIWorkflowError(
-            code="artifact_drift",
-            message="Registered artifact files do not match the approved revision.",
-            exit_code=7,
-            details={"artifact_id": artifact["id"], "issues": issues},
-        )
-
-
 def _validate_requirement_results(value: Any, document: str) -> None:
     items = require_list(value, document, "requirements")
-    if not items:
-        fail_schema(document, "requirements must contain at least one requirement")
     for raw_item in items:
         item = require_mapping(raw_item, document)
         item_id = item.get("id")
@@ -628,6 +791,9 @@ def _validate_requirement_results(value: Any, document: str) -> None:
             not isinstance(item_id, str) or not ID_PATTERNS["requirement"].fullmatch(item_id)
         ):
             fail_schema(document, "requirement id must be a valid REQ id or null")
+        change_kind = item.get("change_kind")
+        if change_kind is not None and change_kind not in {"behavior", "presentation"}:
+            fail_schema(document, "change_kind must be behavior or presentation")
         require_string(item.get("title"), document, "title")
         require_string(item.get("summary"), document, "summary")
         sources = require_source_list(item.get("sources"), document, "sources")
@@ -648,8 +814,6 @@ def _validate_requirement_results(value: Any, document: str) -> None:
 
 def _validate_task_results(value: Any, document: str) -> None:
     items = require_list(value, document, "tasks")
-    if not items:
-        fail_schema(document, "tasks must contain at least one executable task")
     keys: set[str] = set()
     for raw_item in items:
         item = require_mapping(raw_item, document)
@@ -686,35 +850,6 @@ def _validate_design_evidence(value: Any, document: str) -> list[dict[str, str]]
             }
         )
     return normalized
-
-
-def _validate_memory_delta(value: Any, document: str) -> None:
-    items = require_list(value, document, "memory_delta")
-    for raw_item in items:
-        item = require_mapping(raw_item, document)
-        operation = item.get("operation")
-        if operation not in MEMORY_OPERATIONS:
-            fail_schema(document, f"invalid memory operation '{operation}'")
-        memory_type = require_string(item.get("type"), document, "memory type")
-        if memory_type not in MEMORY_TYPES:
-            fail_schema(document, f"invalid memory type '{memory_type}'")
-        require_string(item.get("content"), document, "memory content")
-        evidence = require_evidence_list(item.get("evidence"), document, "evidence")
-        rationale = require_optional_string(item.get("rationale"), document, "rationale")
-        validation = require_optional_string(item.get("validation"), document, "validation")
-        if memory_type == "repository_fact" and not evidence:
-            fail_schema(document, "repository_fact requires evidence")
-        if memory_type in {"architecture_decision", "engineering_default"} and not rationale:
-            fail_schema(document, f"{memory_type} requires rationale")
-        if memory_type in {"engineering_default", "validation_item"} and not validation:
-            fail_schema(document, f"{memory_type} requires validation")
-        target_id = item.get("target_id")
-        if operation == "add" and target_id is not None:
-            fail_schema(document, "add memory operation cannot have target_id")
-        if operation != "add" and (
-            not isinstance(target_id, str) or not ID_PATTERNS["memory"].fullmatch(target_id)
-        ):
-            fail_schema(document, f"{operation} memory operation requires target_id")
 
 
 def _validate_task_id(value: Any, active_item: str | None, document: str) -> None:

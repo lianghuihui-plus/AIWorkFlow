@@ -32,7 +32,7 @@ class TransactionTests(unittest.TestCase):
             original_requirements = store.read_json("requirements.json")
             changed_state = {**original_state, "updated_at": now_iso()}
             changed_requirements = {
-                "schema_version": 9,
+                "schema_version": 11,
                 "items": [
                     {
                         "id": "REQ-001",
@@ -44,6 +44,10 @@ class TransactionTests(unittest.TestCase):
                         "disposition": "proposed",
                         "sources": [{"kind": "prd", "ref": "prd/input.md"}],
                         "origin_revision": 1,
+                        "revision": 1,
+                        "approved_revision": None,
+                        "semantic_sha256": "0" * 64,
+                        "content_sha256": "1" * 64,
                     }
                 ],
             }
@@ -72,7 +76,7 @@ class TransactionTests(unittest.TestCase):
             store = engine.store
             changed_state = {**store.read_json("state.json"), "updated_at": now_iso()}
             changed_requirements = {
-                "schema_version": 9,
+                "schema_version": 11,
                 "items": [
                     {
                         "id": "REQ-001",
@@ -84,6 +88,10 @@ class TransactionTests(unittest.TestCase):
                         "disposition": "proposed",
                         "sources": [{"kind": "prd", "ref": "prd/input.md"}],
                         "origin_revision": 1,
+                        "revision": 1,
+                        "approved_revision": None,
+                        "semantic_sha256": "0" * 64,
+                        "content_sha256": "1" * 64,
                     }
                 ],
             }
@@ -128,7 +136,7 @@ class TransactionTests(unittest.TestCase):
 
             self.assertEqual(raised.exception.code, "idempotency_conflict")
 
-    def test_recovery_removes_orphaned_work_directories(self) -> None:
+    def test_recovery_preserves_unreadable_work_for_local_repair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             engine = bootstrap_engine(Path(directory))
             orphan = engine.store.data_root / "work" / "W-999999"
@@ -137,8 +145,8 @@ class TransactionTests(unittest.TestCase):
 
             recovered = engine.recover()
 
-            self.assertIn("work:W-999999:cleanup", recovered)
-            self.assertFalse(orphan.exists())
+            self.assertEqual(recovered, [])
+            self.assertTrue(orphan.exists())
 
 
 if __name__ == "__main__":

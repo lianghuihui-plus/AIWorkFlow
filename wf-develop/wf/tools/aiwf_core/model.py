@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 STAGES = (
     "analysis",
     "design",
@@ -17,8 +17,7 @@ STAGES = (
     "testing",
     "completed",
 )
-MODES = ("ready", "working", "review", "blocked", "decision")
-ARTIFACT_STATUSES = ("review", "approved", "changes_requested", "stale")
+ARTIFACT_STATUSES = ("review", "approved", "changes_requested")
 REQUIREMENT_DISPOSITIONS = (
     "proposed",
     "accepted",
@@ -28,20 +27,8 @@ REQUIREMENT_DISPOSITIONS = (
 )
 TASK_STATUSES = (
     "proposed",
-    "planned",
-    "in_progress",
-    "implemented",
-    "tested",
-    "stale",
+    "active",
     "withdrawn",
-)
-MEMORY_OPERATIONS = ("add", "update", "retract")
-MEMORY_STATUSES = ("active", "retracted")
-MEMORY_TYPES = (
-    "repository_fact",
-    "architecture_decision",
-    "engineering_default",
-    "validation_item",
 )
 SOURCE_KINDS = (
     "prd",
@@ -50,7 +37,7 @@ SOURCE_KINDS = (
     "repository",
     "agent_inference",
 )
-QUESTION_STATUSES = ("open", "resolved", "superseded")
+QUESTION_STATUSES = ("open", "resolved", "cancelled")
 
 ID_PATTERNS = {
     "requirement": re.compile(r"^REQ-\d{3,}$"),
@@ -58,7 +45,6 @@ ID_PATTERNS = {
     "work": re.compile(r"^W-\d{6,}$"),
     "question": re.compile(r"^Q-\d{3,}$"),
     "decision": re.compile(r"^D-\d{3,}$"),
-    "memory": re.compile(r"^M-\d{3,}$"),
 }
 
 
@@ -71,15 +57,13 @@ class CommandSpec:
 COMMAND_SPECS = (
     CommandSpec("init", "Initialize a workspace."),
     CommandSpec("recover", "Recover an incomplete workspace transaction."),
-    CommandSpec("prepare", "Prepare or resume the current work item."),
+    CommandSpec("prepare", "Prepare a work item for the selected task."),
     CommandSpec("submit", "Submit a semantic artifact and result manifest."),
     CommandSpec("review", "Approve an artifact or request changes."),
     CommandSpec("revise", "Revise an approved artifact revision."),
-    CommandSpec("resolve-drift", "Adopt or discard external artifact content changes."),
     CommandSpec("question", "Record blocking questions for the current work."),
     CommandSpec("decide", "Record a user decision."),
-    CommandSpec("route-decision", "Resume work or revise an upstream artifact after decisions."),
-    CommandSpec("route-upstream", "Revise an upstream artifact after a repository-backed factual correction."),
+    CommandSpec("reconcile", "Confirm that an approved artifact matches current requirements."),
     CommandSpec("status", "Read workspace status without modifying it."),
     CommandSpec("render", "Render the static workspace dashboard."),
 )
@@ -221,40 +205,10 @@ def validate_project(data: dict[str, Any]) -> None:
 def validate_state(data: dict[str, Any]) -> None:
     document = "state.json"
     require_schema_version(document, data)
-    stage = data.get("current_stage")
-    mode = data.get("mode")
-    if stage not in STAGES:
-        fail_schema(document, f"unknown current_stage '{stage}'")
-    if mode not in MODES:
-        fail_schema(document, f"unknown mode '{mode}'")
-    require_optional_string(data.get("active_item"), document, "active_item")
-    active_work = require_optional_string(data.get("active_work"), document, "active_work")
-    active_work_sha256 = require_optional_string(
-        data.get("active_work_sha256"), document, "active_work_sha256"
-    )
-    if active_work is not None and not ID_PATTERNS["work"].fullmatch(active_work):
-        fail_schema(document, f"invalid active_work '{active_work}'")
-    require_string_list(data.get("pending_reviews"), document, "pending_reviews")
-    require_string_list(data.get("blocking_questions"), document, "blocking_questions")
     require_string(data.get("updated_at"), document, "updated_at")
-    if mode in {"working", "blocked", "decision"} and active_work is None:
-        fail_schema(document, f"{mode} mode requires active_work")
-    if mode not in {"working", "blocked", "decision"} and active_work is not None:
-        fail_schema(document, f"{mode} mode cannot retain active_work")
-    if active_work is not None and (
-        active_work_sha256 is None or not re.fullmatch(r"[0-9a-f]{64}", active_work_sha256)
-    ):
-        fail_schema(document, "active work requires active_work_sha256")
-    if active_work is None and active_work_sha256 is not None:
-        fail_schema(document, "active_work_sha256 requires active_work")
-    if mode == "review" and not data["pending_reviews"]:
-        fail_schema(document, "review mode requires pending_reviews")
-    if mode == "blocked" and not data["blocking_questions"]:
-        fail_schema(document, "blocked mode requires blocking_questions")
-    if mode == "decision" and data["blocking_questions"]:
-        fail_schema(document, "decision mode cannot retain blocking_questions")
-    if stage == "completed" and mode != "ready":
-        fail_schema(document, "completed stage must use ready mode")
+    unsupported = set(data) - {"schema_version", "updated_at"}
+    if unsupported:
+        fail_schema(document, f"unsupported fields: {', '.join(sorted(unsupported))}")
 
 
 def validate_requirements(data: dict[str, Any]) -> None:
@@ -276,6 +230,7 @@ def validate_requirements(data: dict[str, Any]) -> None:
             fail_schema(document, f"invalid disposition '{item.get('disposition')}'")
         if type(item.get("origin_revision")) is not int or item["origin_revision"] < 1:
             fail_schema(document, "origin_revision must be a positive integer")
+        _validate_unit_revision(item, document)
 
 
 def validate_tasks(data: dict[str, Any]) -> None:
@@ -302,6 +257,7 @@ def validate_tasks(data: dict[str, Any]) -> None:
             fail_schema(document, f"invalid task status '{item.get('status')}'")
         if type(item.get("origin_revision")) is not int or item["origin_revision"] < 1:
             fail_schema(document, "origin_revision must be a positive integer")
+        _validate_unit_revision(item, document)
         if item.get("status") != "withdrawn" and any(
             status_by_id[dependency] == "withdrawn"
             for dependency in dependencies
@@ -373,6 +329,9 @@ def validate_artifacts(data: dict[str, Any]) -> None:
             fail_schema(document, "approved_revision must be null or a valid revision")
         require_string_list(item.get("depends_on"), document, "depends_on")
         require_string_list(item.get("sources"), document, "sources")
+        require_string_list(
+            item.get("needs_reconcile", []), document, "needs_reconcile"
+        )
 
 
 def validate_decisions(data: dict[str, Any]) -> None:
@@ -380,44 +339,14 @@ def validate_decisions(data: dict[str, Any]) -> None:
     require_schema_version(document, data)
     items = require_list(data.get("items"), document, "items")
     require_unique_ids(document, items, "decision")
-    known_ids = {item["id"] for item in items}
     for raw_item in items:
         item = require_mapping(raw_item, document)
         question_id = require_string(item.get("question_id"), document, "question_id")
         if not ID_PATTERNS["question"].fullmatch(question_id):
             fail_schema(document, f"invalid question_id '{question_id}'")
         require_string(item.get("decision"), document, "decision")
-        impact = require_string_list(item.get("impact"), document, "impact")
-        if not impact or any(stage not in STAGES[:-1] for stage in impact):
-            fail_schema(document, "impact must contain workflow stages")
-        if item.get("status") not in {"active", "superseded"}:
-            fail_schema(document, "decision status must be active or superseded")
-        supersedes = require_string_list(item.get("supersedes"), document, "supersedes")
-        if any(not ID_PATTERNS["decision"].fullmatch(value) for value in supersedes):
-            fail_schema(document, "supersedes must contain decision ids")
-        superseded_by = require_optional_string(
-            item.get("superseded_by"), document, "superseded_by"
-        )
-        if superseded_by is not None and not (
-            ID_PATTERNS["decision"].fullmatch(superseded_by)
-            or re.fullmatch(r"[a-zA-Z0-9-]+@\d+", superseded_by)
-        ):
-            fail_schema(
-                document,
-                "superseded_by must be a decision id, artifact revision, or null",
-            )
-        if item["status"] == "active" and superseded_by is not None:
-            fail_schema(document, "active decisions cannot have superseded_by")
-        if item["status"] == "superseded" and superseded_by is None:
-            fail_schema(document, "superseded decisions require superseded_by")
-        if any(value not in known_ids or value == item["id"] for value in supersedes):
-            fail_schema(document, "supersedes must reference other known decisions")
-        if (
-            superseded_by is not None
-            and ID_PATTERNS["decision"].fullmatch(superseded_by)
-            and superseded_by not in known_ids
-        ):
-            fail_schema(document, "superseded_by references an unknown decision")
+        if item.get("status") != "active":
+            fail_schema(document, "decision status must be active")
         require_string(item.get("created_at"), document, "created_at")
 
 
@@ -437,41 +366,9 @@ def validate_questions(data: dict[str, Any]) -> None:
         active_item = require_optional_string(item.get("active_item"), document, "active_item")
         if active_item is not None and not ID_PATTERNS["task"].fullmatch(active_item):
             fail_schema(document, "question active_item must be a valid task id")
-        impact = require_string_list(item.get("impact"), document, "impact")
-        if not impact or any(stage not in STAGES[:-1] for stage in impact):
-            fail_schema(document, "question impact must contain workflow stages")
-        supersedes = require_string_list(
-            item.get("supersedes_decisions"), document, "supersedes_decisions"
-        )
-        if any(not ID_PATTERNS["decision"].fullmatch(value) for value in supersedes):
-            fail_schema(document, "supersedes_decisions must contain decision ids")
         if item.get("status") not in QUESTION_STATUSES:
             fail_schema(document, f"invalid question status '{item.get('status')}'")
         require_optional_string(item.get("decision_id"), document, "decision_id")
-
-
-def validate_memory(data: dict[str, Any]) -> None:
-    document = "memory.json"
-    require_schema_version(document, data)
-    items = require_list(data.get("items"), document, "items")
-    require_unique_ids(document, items, "memory")
-    for raw_item in items:
-        item = require_mapping(raw_item, document)
-        for field_name in ("type", "content", "source", "updated_at"):
-            require_string(item.get(field_name), document, field_name)
-        if item["type"] not in MEMORY_TYPES:
-            fail_schema(document, f"invalid memory type '{item['type']}'")
-        evidence = require_evidence_list(item.get("evidence"), document, "evidence")
-        rationale = require_optional_string(item.get("rationale"), document, "rationale")
-        validation = require_optional_string(item.get("validation"), document, "validation")
-        if item["type"] == "repository_fact" and not evidence:
-            fail_schema(document, "repository_fact requires evidence")
-        if item["type"] in {"architecture_decision", "engineering_default"} and not rationale:
-            fail_schema(document, f"{item['type']} requires rationale")
-        if item["type"] in {"engineering_default", "validation_item"} and not validation:
-            fail_schema(document, f"{item['type']} requires validation")
-        if item.get("status") not in MEMORY_STATUSES:
-            fail_schema(document, f"invalid memory status '{item.get('status')}'")
 
 
 VALIDATORS = {
@@ -482,7 +379,6 @@ VALIDATORS = {
     "artifacts.json": validate_artifacts,
     "decisions.json": validate_decisions,
     "questions.json": validate_questions,
-    "memory.json": validate_memory,
 }
 
 
@@ -492,6 +388,23 @@ def validate_document(name: str, value: Any) -> dict[str, Any]:
     if validator is not None:
         validator(data)
     return data
+
+
+def _validate_unit_revision(item: dict[str, Any], document: str) -> None:
+    revision = item.get("revision")
+    approved_revision = item.get("approved_revision")
+    if type(revision) is not int or revision < 1:
+        fail_schema(document, "unit revision must be a positive integer")
+    if approved_revision is not None and (
+        type(approved_revision) is not int
+        or approved_revision < 1
+        or approved_revision > revision
+    ):
+        fail_schema(document, "unit approved_revision must reference a valid revision")
+    for field_name in ("semantic_sha256", "content_sha256"):
+        value = item.get(field_name)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            fail_schema(document, f"'{field_name}' must be a SHA-256 digest")
 
 
 def next_id(kind: str, existing_ids: list[str]) -> str:
@@ -507,7 +420,6 @@ def next_id(kind: str, existing_ids: list[str]) -> str:
         "work": "W",
         "question": "Q",
         "decision": "D",
-        "memory": "M",
     }
     return f"{prefixes[kind]}-{maximum + 1:0{widths.get(kind, 3)}d}"
 

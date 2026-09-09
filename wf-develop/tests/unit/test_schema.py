@@ -8,87 +8,51 @@ from aiwf_core.model import AIWorkflowError, SCHEMA_VERSION, next_id, validate_d
 
 
 class SchemaTests(unittest.TestCase):
-    def test_old_workspace_schema_is_rejected_without_migration(self) -> None:
-        project = {
-            "schema_version": 5,
-            "project_id": "old",
-            "name": "Old",
-            "platform": "test",
-            "code_repository": "/tmp/old-repository",
-            "prd_files": [],
-            "created_at": "2026-08-25T10:00:00+08:00",
-        }
-
-        with self.assertRaises(AIWorkflowError) as raised:
-            validate_document("project.json", project)
-
-        self.assertEqual(raised.exception.code, "invalid_schema")
-
-    def test_task_document_rejects_dependency_cycles(self) -> None:
-        tasks = {
-            "schema_version": SCHEMA_VERSION,
-            "items": [
+    def test_state_is_only_lightweight_metadata(self) -> None:
+        validate_document(
+            "state.json",
+            {"schema_version": SCHEMA_VERSION, "updated_at": "2026-09-08T10:00:00+08:00"},
+        )
+        with self.assertRaises(AIWorkflowError):
+            validate_document(
+                "state.json",
                 {
-                    "id": "T-001",
-                    "title": "A",
-                    "requirements": ["REQ-001"],
-                    "depends_on": ["T-002"],
-                    "status": "planned",
-                    "origin_revision": 1,
+                    "schema_version": SCHEMA_VERSION,
+                    "updated_at": "2026-09-08T10:00:00+08:00",
+                    "active_work": "W-000001",
                 },
-                {
-                    "id": "T-002",
-                    "title": "B",
-                    "requirements": ["REQ-001"],
-                    "depends_on": ["T-001"],
-                    "status": "planned",
-                    "origin_revision": 1,
-                },
-            ],
+            )
+
+    def test_dependency_graph_rejects_cycles(self) -> None:
+        base = {
+            "title": "Task",
+            "requirements": ["REQ-001"],
+            "status": "active",
+            "origin_revision": 1,
+            "revision": 1,
+            "approved_revision": 1,
+            "semantic_sha256": "a" * 64,
+            "content_sha256": "b" * 64,
         }
-
         with self.assertRaises(AIWorkflowError) as raised:
-            validate_document("tasks.json", tasks)
-
+            validate_document(
+                "tasks.json",
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "items": [
+                        {"id": "T-001", **base, "depends_on": ["T-002"]},
+                        {"id": "T-002", **base, "depends_on": ["T-001"]},
+                    ],
+                },
+            )
         self.assertEqual(raised.exception.code, "task_dependency_cycle")
 
-    def test_project_requires_code_repository(self) -> None:
-        project = {
-            "schema_version": SCHEMA_VERSION,
-            "project_id": "project",
-            "name": "Project",
-            "platform": "test",
-            "code_repository": None,
-            "prd_files": [],
-            "created_at": "2026-08-25T10:00:00+08:00",
-        }
+    def test_next_id_uses_stable_prefixes(self) -> None:
+        self.assertEqual(next_id("task", ["T-001", "T-003"]), "T-004")
 
-        with self.assertRaises(AIWorkflowError) as raised:
-            validate_document("project.json", project)
-
-        self.assertEqual(raised.exception.code, "invalid_schema")
-
-    def test_state_requires_active_work_while_working(self) -> None:
-        state = {
-            "schema_version": SCHEMA_VERSION,
-            "current_stage": "analysis",
-            "mode": "working",
-            "active_item": None,
-            "active_work": None,
-            "active_work_sha256": None,
-            "pending_reviews": [],
-            "blocking_questions": [],
-            "updated_at": "2026-08-25T10:00:00+08:00",
-        }
-
-        with self.assertRaises(AIWorkflowError) as raised:
-            validate_document("state.json", state)
-
-        self.assertEqual(raised.exception.code, "invalid_schema")
-
-    def test_ids_are_monotonic_and_never_reuse_gaps(self) -> None:
-        self.assertEqual(next_id("requirement", ["REQ-001", "REQ-003"]), "REQ-004")
-        self.assertEqual(next_id("work", ["W-000009"]), "W-000010")
+    def test_project_memory_is_not_a_managed_document(self) -> None:
+        legacy = {"legacy": "ignored"}
+        self.assertIs(validate_document("memory.json", legacy), legacy)
 
 
 if __name__ == "__main__":

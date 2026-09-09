@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support import SOURCE_ROOT, bootstrap_engine, run_cli
+from support import SOURCE_ROOT, bootstrap_engine, run_cli, write_work_outputs
 
 from aiwf_core.model import validate_document
 from aiwf_core.storage import DATA_FILES, InjectedTransactionFailure, json_bytes
@@ -64,6 +64,14 @@ class InitializationTests(unittest.TestCase):
             for name in DATA_FILES:
                 document = json.loads((workspace / ".aiwf" / name).read_text(encoding="utf-8"))
                 validate_document(name, document)
+
+    def test_initialization_does_not_create_unused_project_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            bootstrap_engine(workspace)
+
+            self.assertFalse((workspace / ".aiwf/memory.json").exists())
+            self.assertFalse((workspace / ".aiwf/memory.md").exists())
 
     def test_prd_directory_discovery_is_non_recursive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -228,7 +236,9 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             result = json.loads(completed.stdout)["result"]
             self.assertEqual(result["project"]["project_id"], "test-project")
-            self.assertEqual(result["state"]["current_stage"], "analysis")
+            self.assertNotIn("current_stage", result["state"])
+            self.assertEqual(result["current_stage"], "analysis")
+            self.assertEqual(result["recommended_work"]["stage"], "analysis")
             self.assertEqual(result["next_action"], "analyze_requirements")
 
     def test_status_does_not_change_workspace_files_or_metadata(self) -> None:
@@ -242,7 +252,7 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(workspace_snapshot(workspace), before)
 
-    def test_unavailable_code_repository_is_a_blocking_health_issue(self) -> None:
+    def test_unavailable_code_repository_is_a_non_blocking_status_warning(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             workspace = root / "workspace"
@@ -271,13 +281,54 @@ class StatusTests(unittest.TestCase):
                 run_cli(["status", "--workspace", str(workspace)]).stdout
             )["result"]
 
-            self.assertFalse(status["can_advance"])
-            self.assertEqual(status["next_action"], "resolve_health_issues")
+            self.assertNotIn("can_advance", status)
+            self.assertEqual(status["next_action"], "analyze_requirements")
+            self.assertEqual(status["recommended_work"]["stage"], "analysis")
             issue = next(
                 item for item in status["issues"] if item["type"] == "code_repository_unavailable"
             )
-            self.assertTrue(issue["blocking"])
+            self.assertFalse(issue["blocking"])
             self.assertEqual(issue["recovery_action"], "restore_code_repository")
+
+    def test_unavailable_code_repository_does_not_block_prepare_or_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            repository = Path(engine.store.read_json("project.json")["code_repository"])
+            for path in repository.iterdir():
+                path.unlink()
+            repository.rmdir()
+
+            work = engine.prepare_work()
+            write_work_outputs(
+                engine,
+                work,
+                markdown="# Analysis\n\nRepository access is not required to register this artifact.\n",
+                result={
+                    "schema_version": 11,
+                    "stage": "analysis",
+                    "target_platform": "test",
+                    "requirements": [
+                        {
+                            "title": "Save drafts",
+                            "summary": "Persist and restore drafts.",
+                            "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                            "platform_scope": "target",
+                            "change_type": "new",
+                            "scope_reason": "Core target behavior.",
+                            "disposition": "proposed",
+                        }
+                    ],
+                    "withdrawn_requirements": [],
+                },
+            )
+
+            submitted = engine.submit_work(str(work["work_id"]))
+
+            self.assertEqual(work["repository_context"], {"root": str(repository.resolve())})
+            self.assertEqual(submitted["artifact_id"], "analysis")
+            self.assertEqual(submitted["revision"], 1)
 
     def test_status_reports_pending_recovery_without_recovering(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

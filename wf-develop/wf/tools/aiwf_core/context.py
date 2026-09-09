@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from typing import Any
 
 from .artifacts import artifact_identity, result_schema, result_seed
@@ -30,7 +29,7 @@ def build_work(
     sources: list[str],
     stage_guide: dict[str, Any],
     constraints: list[str],
-    memory_content: str,
+    decision_content: str,
     target_platform: str,
     facts: dict[str, Any] | None = None,
     repository_context: dict[str, Any] | None = None,
@@ -54,10 +53,7 @@ def build_work(
         "inputs": inputs,
         "depends_on": depends_on,
         "sources": sources,
-        "memory_context": {
-            "sha256": hashlib.sha256(memory_content.encode("utf-8")).hexdigest(),
-            "content": memory_content,
-        },
+        "decision_context": build_decision_context(decision_content),
         "draft_output": f".aiwf/work/{work_id}/artifact.md",
         "result_output": f".aiwf/work/{work_id}/result.json",
         "result_schema": result_schema(stage, active_item),
@@ -73,6 +69,13 @@ def build_work(
         work["repository_context"] = repository_context
     validate_work(work)
     return work
+
+
+def build_decision_context(content: str) -> dict[str, str]:
+    return {
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "content": content,
+    }
 
 
 def validate_work(value: Any) -> dict[str, Any]:
@@ -101,15 +104,15 @@ def validate_work(value: Any) -> dict[str, Any]:
         "created_at",
     ):
         require_string(work.get(field_name), document, field_name)
-    memory_context = require_mapping(work.get("memory_context"), document)
-    memory_content = require_string(
-        memory_context.get("content"), document, "memory_context.content", empty=True
+    decision_context = require_mapping(work.get("decision_context"), document)
+    decision_content = require_string(
+        decision_context.get("content"), document, "decision_context.content", empty=True
     )
-    memory_sha256 = require_string(
-        memory_context.get("sha256"), document, "memory_context.sha256"
+    decision_sha256 = require_string(
+        decision_context.get("sha256"), document, "decision_context.sha256"
     )
-    if hashlib.sha256(memory_content.encode("utf-8")).hexdigest() != memory_sha256:
-        fail_schema(document, "memory_context sha256 does not match its content")
+    if hashlib.sha256(decision_content.encode("utf-8")).hexdigest() != decision_sha256:
+        fail_schema(document, "decision_context sha256 does not match its content")
     require_mapping(work.get("result_schema"), document)
     require_mapping(work.get("result_seed"), document)
     stage_guide = require_mapping(work.get("stage_guide"), document)
@@ -131,93 +134,9 @@ def validate_work(value: Any) -> dict[str, Any]:
     require_mapping(work.get("facts"), document)
     if "repository_context" in work:
         repository = require_mapping(work.get("repository_context"), document)
-        if repository.get("type") not in {"git", "directory"}:
-            fail_schema(document, "repository_context.type must be git or directory")
-        require_string(repository.get("path"), document, "repository_context.path")
         require_string(repository.get("root"), document, "repository_context.root")
-        git_root = repository.get("git_root")
-        if git_root is not None and not isinstance(git_root, str):
-            fail_schema(document, "repository_context.git_root must be a string or null")
-        require_string(
-            repository.get("scope_prefix"),
-            document,
-            "repository_context.scope_prefix",
-            empty=True,
-        )
-        head = repository.get("head")
-        if head is not None and not isinstance(head, str):
-            fail_schema(document, "repository_context.head must be a string or null")
-        require_string_list(
-            repository.get("status_lines"),
-            document,
-            "repository_context.status_lines",
-        )
-        if repository.get("verification_level") not in {"git_delta", "limited"}:
-            fail_schema(
-                document,
-                "repository_context.verification_level must be git_delta or limited",
-            )
-        fingerprints = require_mapping(
-            repository.get("status_fingerprints"),
-            document,
-        )
-        for relative_path, raw_fingerprint in fingerprints.items():
-            if not isinstance(relative_path, str) or not relative_path:
-                fail_schema(document, "repository fingerprint paths must be non-empty strings")
-            fingerprint = require_mapping(raw_fingerprint, document)
-            require_string(
-                fingerprint.get("status"),
-                document,
-                "repository_context.status_fingerprints.status",
-            )
-            digest = fingerprint.get("sha256")
-            if digest is not None and (
-                not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
-            ):
-                fail_schema(document, "repository fingerprint sha256 must be a digest or null")
-        require_string_list(
-            repository.get("carried_changes"), document, "repository_context.carried_changes"
-        )
-        pause_checkpoint = repository.get("pause_checkpoint")
-        if pause_checkpoint is not None and not isinstance(pause_checkpoint, dict):
-            fail_schema(document, "repository_context.pause_checkpoint must be an object or null")
+        if set(repository) != {"root"}:
+            fail_schema(document, "repository_context only supports the root field")
     require_optional_string(work.get("predecessor"), document, "predecessor")
     require_optional_string(work.get("feedback"), document, "feedback")
     return work
-
-
-def copy_successor_work(
-    previous: dict[str, Any],
-    *,
-    work_id: str,
-    feedback: str | None = None,
-    memory_content: str | None = None,
-    repository_context: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    return build_work(
-        work_id=work_id,
-        stage=previous["stage"],
-        active_item=previous["active_item"],
-        goal=previous["goal"],
-        inputs=list(previous["inputs"]),
-        depends_on=list(previous["depends_on"]),
-        sources=list(previous["sources"]),
-        stage_guide=dict(previous["stage_guide"]),
-        constraints=list(previous["constraints"]),
-        memory_content=(
-            memory_content
-            if memory_content is not None
-            else previous["memory_context"]["content"]
-        ),
-        target_platform=previous["target_platform"],
-        facts=dict(previous["facts"]),
-        repository_context=(
-            repository_context
-            if repository_context is not None
-            else dict(previous["repository_context"])
-            if "repository_context" in previous
-            else None
-        ),
-        predecessor=previous["work_id"],
-        feedback=feedback if feedback is not None else previous.get("feedback"),
-    )

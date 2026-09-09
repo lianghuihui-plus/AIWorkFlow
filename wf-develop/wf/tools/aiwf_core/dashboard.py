@@ -23,30 +23,38 @@ MODE_LABELS = {
     "working": "进行中",
     "review": "待审核",
     "blocked": "已阻塞",
-    "decision": "待路由",
 }
 STATUS_LABELS = {
     "review": "待审核",
     "approved": "已批准",
     "changes_requested": "需修改",
-    "stale": "已失效",
+    "needs_reconcile": "待核对",
     "proposed": "待确认",
     "accepted": "已纳入",
     "deferred": "暂缓",
     "excluded": "不纳入",
     "withdrawn": "已撤回",
-    "planned": "已规划",
     "in_progress": "进行中",
-    "implemented": "已实现",
-    "tested": "已测试",
+    "active": "有效",
+    "not_started": "未开始",
+    "ready": "可开始",
+    "in_progress": "进行中",
+    "dependency_blocked": "依赖阻塞",
+    "completed": "已完成",
+    "optional": "可选",
+    "not_run": "未执行",
+    "failed": "失败",
+    "skipped": "已跳过",
+    "specification": "规格中",
+    "implementation": "实现中",
+    "testing": "测试中",
     "open": "待决策",
     "resolved": "已解决",
-    "superseded": "已替代",
+    "cancelled": "已取消",
 }
 ACTION_LABELS = {
     "review": "审核产物",
     "decide": "处理人工决策",
-    "route_decision": "路由人工决策",
     "resume": "继续当前工作",
     "plan_tasks": "拆解任务计划",
     "generate_specification": "生成任务规格",
@@ -55,7 +63,6 @@ ACTION_LABELS = {
     "implement_code": "实现代码",
     "write_unit_tests": "编写单元测试",
     "completed": "流程已完成",
-    "resolve_health_issues": "处理健康问题",
 }
 PLATFORM_SCOPE_LABELS = {
     "target": "目标端",
@@ -81,42 +88,44 @@ def render_dashboard(
     artifacts: dict[str, Any],
     questions: dict[str, Any],
     decisions: dict[str, Any],
-    memory: dict[str, Any],
     events: list[dict[str, Any]],
     artifact_bodies: dict[str, str],
     next_action: str,
-    can_advance: bool,
-    decision_context: list[dict[str, Any]],
-    health_issues: list[dict[str, Any]],
+    current_stage: str,
+    stage_progress: dict[str, str],
+    task_progress: list[dict[str, Any]],
+    implementation_complete: bool,
 ) -> str:
     open_questions = [item for item in questions["items"] if item["status"] == "open"]
-    active_memory = [item for item in memory["items"] if item["status"] == "active"]
     pending_reviews = set(state["pending_reviews"])
 
-    pipeline_markup = _render_pipeline(state)
+    pipeline_markup = _render_pipeline(
+        state,
+        current_stage=current_stage,
+        stage_progress=stage_progress,
+    )
     context_markup = _render_context(
         project,
         requirements,
         artifact_bodies.get("analysis", ""),
-        health_issues,
     )
     todo_markup = _render_todos(
         open_questions=open_questions,
-        decision_context=decision_context,
         pending_reviews=pending_reviews,
         artifacts=artifacts["items"],
-        health_issues=health_issues,
         next_action=next_action,
-        can_advance=can_advance,
     )
     question_markup = _render_questions(open_questions)
-    decision_route_markup = _render_decision_routes(decision_context)
     requirement_markup = _render_requirements(requirements["items"])
-    task_markup = _render_tasks(tasks["items"], artifacts["items"])
+    task_markup = _render_tasks(
+        tasks["items"],
+        artifacts["items"],
+        task_progress=task_progress,
+        implementation_complete=implementation_complete,
+    )
     artifact_markup = _render_artifacts(artifacts["items"])
     preview_markup = _render_artifact_previews(artifacts["items"], artifact_bodies)
     decision_markup = _render_decisions(decisions["items"])
-    memory_markup = _render_memory_items(active_memory)
     event_markup = _render_events(events)
 
     return f"""<!doctype html>
@@ -180,7 +189,7 @@ def render_dashboard(
     .hero {{ border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 24px; box-shadow: var(--shadow); }}
     .hero-top {{ display: grid; grid-template-columns: minmax(260px, 1fr) auto; gap: 20px; align-items: start; }}
     .hero-meta {{ color: var(--muted); text-align: right; }}
-    .pipeline {{ display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 18px; margin-top: 18px; }}
+    .pipeline {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 18px; margin-top: 18px; }}
     .pipeline-step {{ position: relative; display: flex; align-items: flex-start; gap: 8px; min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-soft); padding: 10px; }}
     .pipeline-step::after {{ content: ""; position: absolute; top: 50%; right: -15px; width: 12px; height: 12px; border-top: 2px solid var(--line); border-right: 2px solid var(--line); transform: translateY(-50%) rotate(45deg); }}
     .pipeline-step:last-child::after {{ display: none; }}
@@ -193,7 +202,7 @@ def render_dashboard(
     .pipeline-step.blocked {{ border-color: var(--accent-border); background: var(--accent-soft); }}
     .pipeline-step.blocked::after {{ border-color: var(--accent); }}
     .pipeline-step.blocked .pipeline-dot {{ border-color: var(--accent); background: var(--accent); color: #ffffff; }}
-    .metrics {{ display: grid; grid-template-columns: repeat(3, minmax(150px, 1fr)); gap: 10px; margin-top: 20px; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(2, minmax(150px, 1fr)); gap: 10px; margin-top: 20px; }}
     .metric {{ display: block; min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card-bg); padding: 12px; color: inherit; text-decoration: none; }}
     a.metric:hover {{ border-color: var(--accent-border); box-shadow: 0 6px 18px rgba(29, 78, 216, 0.10); text-decoration: none; }}
     .metric span {{ display: block; color: var(--muted); font-size: 12px; }}
@@ -260,6 +269,10 @@ def render_dashboard(
     .task-title > strong {{ color: var(--accent); }}
     .task-title > .task-requirements {{ margin-top: 4px; color: var(--muted); font-size: 12px; }}
     .task-title > .pill {{ width: fit-content; max-width: 100%; margin-top: 6px; }}
+    .task-status-summary {{ display: grid; grid-template-columns: minmax(180px, 0.7fr) minmax(0, 1.3fr); gap: 10px; margin-bottom: 12px; }}
+    .task-status-group {{ min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card-bg); padding: 12px; }}
+    .task-status-group > span {{ display: block; margin-bottom: 7px; color: var(--muted); font-size: 12px; }}
+    .test-status-counts {{ display: flex; flex-wrap: wrap; gap: 6px; }}
     .task-checkpoints {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }}
     .task-checkpoint {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card-inner-bg); padding: 8px; color: inherit; text-decoration: none; }}
     a.task-checkpoint:hover {{ border-color: var(--accent-border); text-decoration: none; }}
@@ -282,6 +295,8 @@ def render_dashboard(
     .artifact-main {{ display: flex; align-items: center; flex-wrap: wrap; gap: 10px; min-width: 0; }}
     .artifact-main strong {{ font-size: 18px; }}
     .artifact-links {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }}
+    .artifact-impact {{ display: grid; gap: 7px; margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; }}
+    .artifact-impact p {{ margin: 0; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; }}
     .status-count strong {{ font-weight: 650; }}
     .artifact-preview {{ overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card-bg); scroll-margin-top: 18px; }}
     .artifact-preview[open] {{ border-color: var(--accent-border); }}
@@ -289,6 +304,7 @@ def render_dashboard(
     .artifact-preview-head {{ display: grid; gap: 4px; min-width: 0; }}
     .artifact-preview-head span {{ color: var(--muted); font-size: 12px; font-weight: 650; }}
     .artifact-preview-head strong {{ overflow-wrap: anywhere; font-size: 13px; }}
+    .artifact-preview > .artifact-impact {{ margin: 0; padding: 12px 16px; }}
     .artifact-markdown {{ display: grid; gap: 12px; padding: 20px; font-size: 15px; line-height: 1.72; }}
     .artifact-markdown > :first-child {{ margin-top: 0; }}
     .artifact-markdown h2, .artifact-markdown h3, .artifact-markdown h4, .artifact-markdown h5 {{ margin: 14px 0 0; color: var(--text); font-weight: 700; line-height: 1.35; }}
@@ -378,6 +394,7 @@ def render_dashboard(
       .outline-collapsed .outline-title, .outline-collapsed .outline a {{ display: block; }}
       .outline-collapsed .outline-head {{ justify-content: space-between; margin-bottom: 8px; }}
       .hero-top, .context-grid, .task-card {{ grid-template-columns: 1fr; }}
+      .task-status-summary {{ grid-template-columns: 1fr; }}
       .hero-meta {{ text-align: left; }}
       .metrics, .pipeline {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .pipeline-step::after {{ display: none; }}
@@ -414,13 +431,11 @@ def render_dashboard(
           <a href="#context">项目上下文</a>
           <a href="#todos">人工待办</a>
           <a href="#issues">待决策问题</a>
-          <a href="#decision-route">当前决策路由</a>
           <a href="#tasks">任务进展</a>
           <a href="#artifacts">阶段产物状态</a>
           <a href="#artifact-content">产物内容</a>
           <a href="#requirements">需求纳入决策</a>
           <a href="#decisions">决策归档</a>
-          <a href="#memory">项目记忆</a>
           <a href="#events">工作日志</a>
         </nav>
       </aside>
@@ -436,7 +451,6 @@ def render_dashboard(
           {pipeline_markup}
           <div class="metrics">
             {_metric("待决策问题", len(open_questions), "#issues")}
-            {_metric("待处理决策", len(decision_context), "#decision-route")}
             {_metric("待审核/需修改产物", len(pending_reviews), "#artifacts")}
           </div>
         </header>
@@ -455,11 +469,6 @@ def render_dashboard(
           <section class="panel" id="issues">
             {_section_heading("待决策问题", "需要人工确认后才能继续推进的需求或技术问题。")}
             {question_markup}
-          </section>
-
-          <section class="panel" id="decision-route">
-            {_section_heading("当前决策路由", "已作出的决定及其对当前工作的预估影响。")}
-            {decision_route_markup}
           </section>
 
           <section class="panel" id="tasks">
@@ -483,7 +492,6 @@ def render_dashboard(
           </section>
 
           {_collapsible_section("decisions", "决策归档", "全部已确认的人工决策记录。", decision_markup)}
-          {_collapsible_section("memory", "项目记忆", "跨阶段持续生效的项目事实和约束。", memory_markup)}
           {_collapsible_section("events", "工作日志", "结构化事件按最新优先展示。", event_markup)}
         </main>
       </div>
@@ -557,13 +565,30 @@ def render_dashboard(
 """
 
 
-def _render_pipeline(state: dict[str, Any]) -> str:
-    current = STAGES.index(state["current_stage"])
+def _render_pipeline(
+    state: dict[str, Any],
+    *,
+    current_stage: str,
+    stage_progress: dict[str, str],
+) -> str:
     steps = []
-    for index, stage in enumerate(STAGES):
-        if index < current:
-            css_class, note = "done", "已完成"
-        elif index == current:
+    for index, stage in enumerate(STAGES[:-1]):
+        progress = stage_progress[stage]
+        css_class = {
+            "completed": "done",
+            "review": "review",
+            "changes_requested": "blocked",
+            "needs_reconcile": "blocked",
+            "blocked": "blocked",
+            "failed": "blocked",
+            "skipped": "upcoming",
+            "optional": "upcoming",
+            "ready": "current",
+            "in_progress": "current",
+            "not_started": "upcoming",
+        }[progress]
+        note = STATUS_LABELS[progress]
+        if stage == current_stage and state["mode"] != "ready":
             css_class = (
                 "review"
                 if state["mode"] == "review"
@@ -572,8 +597,6 @@ def _render_pipeline(state: dict[str, Any]) -> str:
                 else "current"
             )
             note = MODE_LABELS[state["mode"]]
-        else:
-            css_class, note = "upcoming", "未开始"
         steps.append(
             '<div class="pipeline-step '
             f'{css_class}" data-state="{css_class}">'
@@ -588,15 +611,12 @@ def _render_context(
     project: dict[str, Any],
     requirements: dict[str, Any],
     analysis_body: str,
-    health_issues: list[dict[str, Any]],
 ) -> str:
     prd_files = "".join(f'<span class="path">{_escape(path)}</span>' for path in project["prd_files"])
     disposition_counts: dict[str, int] = {}
     for item in requirements["items"]:
         disposition_counts[item["disposition"]] = disposition_counts.get(item["disposition"], 0) + 1
     summary = _analysis_summary(analysis_body, requirements["items"])
-    workspace_status = "结构完整" if not health_issues else f"{len(health_issues)} 个健康问题"
-    status_tone = "ok" if not health_issues else "danger"
     return f"""
     <div class="context-grid">
       <article class="context-card summary-card">
@@ -604,7 +624,7 @@ def _render_context(
         <div class="summary-block">{_inline(summary)}</div>
       </article>
       <aside class="context-card meta-card">
-        <div class="meta-row"><span>工作空间</span><div class="meta-value"><span class="pill {status_tone}">{_escape(workspace_status)}</span></div></div>
+        <div class="meta-row"><span>工作空间</span><div class="meta-value"><span class="pill ok">结构完整</span></div></div>
         <div class="meta-row"><span>PRD</span><strong>{len(project['prd_files'])} 份</strong></div>
         <div class="meta-row"><span>平台</span><strong>{_escape(project['platform'])}</strong></div>
         <div class="meta-row repo-row"><span>代码仓库</span><div class="meta-value path">{_escape(project['code_repository'])}</div></div>
@@ -646,32 +666,11 @@ def _analysis_summary(body: str, requirements: list[dict[str, Any]]) -> str:
 def _render_todos(
     *,
     open_questions: list[dict[str, Any]],
-    decision_context: list[dict[str, Any]],
     pending_reviews: set[str],
     artifacts: list[dict[str, Any]],
-    health_issues: list[dict[str, Any]],
     next_action: str,
-    can_advance: bool,
 ) -> str:
     cards = []
-    for issue in health_issues:
-        outcomes = issue.get("allowed_outcomes", [])
-        detail = [
-            f"恢复动作：{issue['recovery_action']}",
-            f"允许结果：{', '.join(outcomes)}" if outcomes else "",
-        ]
-        cards.append(
-            _todo_card(
-                "健康检查",
-                issue["type"],
-                issue["message"],
-                detail,
-                status="阻塞" if issue.get("blocking") else "警告",
-                tone="danger" if issue.get("blocking") else "warn",
-                target=_health_issue_target(issue, artifacts),
-                action="去处理",
-            )
-        )
     for question in open_questions:
         cards.append(
             _todo_card(
@@ -682,19 +681,6 @@ def _render_todos(
                 status="待决策",
                 tone="warn",
                 target="#issues",
-                action="去处理",
-            )
-        )
-    for item in decision_context:
-        cards.append(
-            _todo_card(
-                "决策路由",
-                item["question_id"],
-                item["question"],
-                [f"决定：{item['decision']}", f"预估影响：{', '.join(item['impact'])}"],
-                status="待路由",
-                tone="warn",
-                target="#decision-route",
                 action="去处理",
             )
         )
@@ -718,7 +704,7 @@ def _render_todos(
             )
         )
     if not cards:
-        message = f"当前没有人工待办，下一步：{ACTION_LABELS.get(next_action, next_action)}。" if can_advance else "当前没有可执行的人工待办。"
+        message = f"当前没有人工待办，下一步：{ACTION_LABELS.get(next_action, next_action)}。"
         return _empty(message)
     return '<div class="todo-list">' + "".join(cards) + "</div>"
 
@@ -751,23 +737,6 @@ def _todo_card(
     """
 
 
-def _health_issue_target(issue: dict[str, Any], artifacts: list[dict[str, Any]]) -> str:
-    details = issue.get("details", {})
-    artifact_id = details.get("artifact_id")
-    if artifact_id and any(item["id"] == artifact_id for item in artifacts):
-        return f"#{_artifact_anchor(artifact_id)}"
-    issue_type = issue["type"]
-    if issue_type == "generated_view_drift":
-        return "#memory"
-    if issue_type in {"design_requirement_mismatch"}:
-        return _artifact_target("design", artifacts, "#artifacts")
-    if issue_type in {"task_reference_mismatch", "uncovered_requirements"}:
-        return _artifact_target("task-plan", artifacts, "#artifacts")
-    if issue_type == "blocking_question_mismatch":
-        return "#issues"
-    return "#context"
-
-
 def _artifact_target(
     artifact_id: str, artifacts: list[dict[str, Any]], fallback: str
 ) -> str:
@@ -788,26 +757,9 @@ def _render_questions(items: list[dict[str, Any]]) -> str:
               <p>{_escape(item['reason'])}</p>
               <div class="record-grid">
                 <div><span>AI 建议</span><strong>{_escape(item['recommendation'])}</strong></div>
-                <div><span>影响</span><strong>{_escape(', '.join(item['impact']))}</strong></div>
+                <div><span>关联阶段</span><strong>{_escape(STAGE_LABELS[item['stage']])}</strong></div>
                 <div><span>关联工作</span><strong>{_escape(item['work_id'])}{_escape(' · ' + item['active_item'] if item['active_item'] else '')}</strong></div>
               </div>
-            </article>
-            """
-        )
-    return '<div class="record-list">' + "".join(cards) + "</div>"
-
-
-def _render_decision_routes(items: list[dict[str, Any]]) -> str:
-    if not items:
-        return _empty("当前无需路由决定。")
-    cards = []
-    for item in items:
-        cards.append(
-            f"""
-            <article class="record-card">
-              <div class="record-head"><h3>{_escape(item['question_id'])} · {_escape(item['question'])}</h3><span class="pill warn">待路由</span></div>
-              <p>决定：{_escape(item['decision'])}</p>
-              <div class="record-meta"><span class="tag">预估影响：{_escape(', '.join(item['impact']))}</span></div>
             </article>
             """
         )
@@ -870,7 +822,11 @@ def _render_requirements(items: list[dict[str, Any]]) -> str:
 
 
 def _render_tasks(
-    items: list[dict[str, Any]], artifacts: list[dict[str, Any]]
+    items: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+    *,
+    task_progress: list[dict[str, Any]] | None = None,
+    implementation_complete: bool = False,
 ) -> str:
     if not items:
         return _empty("暂无任务；任务将在任务规格阶段建立。")
@@ -880,6 +836,7 @@ def _render_tasks(
         for artifact in artifacts
         if artifact["active_item"] is not None
     }
+    progress_by_id = {item["id"]: item for item in task_progress or []}
     for item in items:
         requirements = ", ".join(item["requirements"]) or "-"
         checkpoints = []
@@ -894,20 +851,64 @@ def _render_tasks(
                     f'<div class="task-checkpoint muted"><span>{_escape(label)}</span><strong>未生成</strong></div>'
                 )
                 continue
-            tone = _status_tone(artifact["status"])
+            display_status = (
+                artifact.get("test_status", artifact["status"])
+                if stage == "testing"
+                else "needs_reconcile"
+                if artifact.get("needs_reconcile")
+                else artifact["status"]
+            )
+            tone = _status_tone(display_status)
             checkpoints.append(
                 f'<a class="task-checkpoint {tone}" href="#{_artifact_anchor(artifact["id"])}">'
-                f'<span>{_escape(label)}</span>{_pill(artifact["status"])}</a>'
+                f'<span>{_escape(label)}</span>{_pill(display_status)}</a>'
             )
+        progress_status = progress_by_id.get(item["id"], {}).get("status")
+        if progress_status is None:
+            progress_status = _derived_task_status(item["id"], artifacts_by_task_and_stage)
+        if item["status"] == "withdrawn":
+            progress_status = "withdrawn"
         cards.append(
             f"""
             <article class="task-card">
-              <div class="task-title"><strong>{_escape(item['id'])} · {_escape(item['title'])}</strong><span class="task-requirements">需求：{_escape(requirements)}</span>{_pill(item['status'])}</div>
+              <div class="task-title"><strong>{_escape(item['id'])} · {_escape(item['title'])}</strong><span class="task-requirements">需求：{_escape(requirements)}</span>{_pill(progress_status)}</div>
               <div class="task-checkpoints">{''.join(checkpoints)}</div>
             </article>
             """
         )
-    return '<div class="task-board">' + "".join(cards) + "</div>"
+    progress_items = task_progress or []
+    test_counts = {
+        status: sum(item.get("test_status") == status for item in progress_items)
+        for status in ("not_run", "completed", "failed", "skipped")
+    }
+    test_summary = "".join(
+        f'<span class="tag">{_escape(STATUS_LABELS[status])}：{count}</span>'
+        for status, count in test_counts.items()
+    )
+    summary = (
+        '<div class="task-status-summary">'
+        '<div class="task-status-group"><span>需求实现状态</span>'
+        + _pill("completed" if implementation_complete else "in_progress")
+        + '</div><div class="task-status-group"><span>单元测试状态</span>'
+        + f'<div class="test-status-counts">{test_summary}</div></div></div>'
+    )
+    return summary + '<div class="task-board">' + "".join(cards) + "</div>"
+
+
+def _derived_task_status(
+    task_id: str,
+    artifacts: dict[tuple[str | None, str], dict[str, Any]],
+) -> str:
+    for stage in ("testing", "implementation", "specification"):
+        artifact = artifacts.get((task_id, stage))
+        if artifact is None:
+            continue
+        if artifact["status"] != "approved":
+            return artifact["status"]
+        return "completed" if stage == "testing" else (
+            "testing" if stage == "implementation" else "implementation"
+        )
+    return "specification"
 
 
 def _render_artifacts(items: list[dict[str, Any]]) -> str:
@@ -921,10 +922,16 @@ def _render_artifacts(items: list[dict[str, Any]]) -> str:
         group = grouped.get(stage, [])
         if not group:
             continue
-        approved = sum(item["status"] == "approved" for item in group)
+        approved = sum(
+            item["status"] == "approved" and not item.get("needs_reconcile")
+            for item in group
+        )
         group_tone = (
             "danger"
-            if any(item["status"] in {"changes_requested", "stale"} for item in group)
+            if any(
+                item["status"] == "changes_requested" or item.get("needs_reconcile")
+                for item in group
+            )
             else "warn"
             if any(item["status"] == "review" for item in group)
             else "ok"
@@ -936,10 +943,11 @@ def _render_artifacts(items: list[dict[str, Any]]) -> str:
             body = f"""
               <div class="artifact-main">
                 <span class="path">{_escape(item['path'])}</span>
-                {_pill(item['status'])}
+                {_pill('needs_reconcile' if item.get('needs_reconcile') else item['status'])}
                 <a class="artifact-link" href="#{_artifact_anchor(item['id'])}">查看内容</a>
               </div>
               <div class="artifact-meta"><span>版本：r{item['revision']}</span><span>更新时间：{_escape(_format_timestamp(item['updated_at']))}</span></div>
+              {_render_artifact_impact(item)}
             """
         else:
             links = "".join(
@@ -948,7 +956,10 @@ def _render_artifacts(items: list[dict[str, Any]]) -> str:
             )
             status_counts: dict[str, int] = {}
             for item in group:
-                status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
+                display_status = (
+                    "needs_reconcile" if item.get("needs_reconcile") else item["status"]
+                )
+                status_counts[display_status] = status_counts.get(display_status, 0) + 1
             counts = "".join(
                 f'<span class="status-count {_status_tone(status)}"><strong>{_escape(STATUS_LABELS.get(status, status))}</strong>：{count}</span>'
                 for status, count in status_counts.items()
@@ -957,6 +968,7 @@ def _render_artifacts(items: list[dict[str, Any]]) -> str:
               <div class="artifact-main"><strong>{approved}/{len(group)} 已批准</strong></div>
               <div class="artifact-meta">{counts}</div>
               <div class="artifact-links">{links}</div>
+              {''.join(_render_artifact_impact(item) for item in group if item['status'] == 'review')}
             """
         cards.append(
             f'<article class="artifact-summary-card {group_tone}"><div class="artifact-summary-head"><h3>{_escape(STAGE_LABELS[stage])}</h3></div>{body}</article>'
@@ -975,13 +987,26 @@ def _render_artifact_previews(items: list[dict[str, Any]], bodies: dict[str, str
             <details class="artifact-preview" id="{_artifact_anchor(item['id'])}">
               <summary>
                 <div class="artifact-preview-head"><span>{_escape(STAGE_LABELS[item['stage']])}</span><strong>{_escape(item['path'])}</strong></div>
-                {_pill(item['status'])}
+                {_pill('needs_reconcile' if item.get('needs_reconcile') else item.get('test_status', item['status']))}
               </summary>
+              {_render_artifact_impact(item)}
               {_render_markdown(body)}
             </details>
             """
         )
     return '<div class="artifact-preview-list">' + "".join(previews) + "</div>"
+
+
+def _render_artifact_impact(item: dict[str, Any]) -> str:
+    reasons = item.get("needs_reconcile", [])
+    if not reasons:
+        return ""
+    tags = ["状态：待核对", f"直接原因：{', '.join(reasons)}"]
+    return (
+        '<div class="artifact-impact"><div class="tag-list">'
+        + "".join(f'<span class="tag">{_escape(tag)}</span>' for tag in tags)
+        + "</div></div>"
+    )
 
 
 def _render_decisions(items: list[dict[str, Any]]) -> str:
@@ -993,30 +1018,12 @@ def _render_decisions(items: list[dict[str, Any]]) -> str:
             "title": f"{item['id']} · {item['question_id']}",
             "details": [
                 ("决策", item["decision"]),
-                ("状态", "当前有效" if item["status"] == "active" else "已被替代"),
-                ("影响", ", ".join(item["impact"])),
+                ("状态", "已记录"),
             ],
         }
         for item in items
     ]
     return _render_timeline(records)
-
-
-def _render_memory_items(items: list[dict[str, Any]]) -> str:
-    if not items:
-        return _empty("暂无长期记忆。")
-    cards = []
-    for item in items:
-        cards.append(
-            f"""
-            <article class="record-card">
-              <div class="record-head"><h3>{_escape(item['id'])} · {_escape(item['type'])}</h3><span class="pill ok">生效中</span></div>
-              <p>{_escape(item['content'])}</p>
-              <div class="record-meta"><span class="tag">来源：{_escape(item['source'])}</span><span class="tag">{_escape(item['updated_at'])}</span></div>
-            </article>
-            """
-        )
-    return '<div class="record-list">' + "".join(cards) + "</div>"
 
 
 def _render_events(items: list[dict[str, Any]]) -> str:
@@ -1026,14 +1033,11 @@ def _render_events(items: list[dict[str, Any]]) -> str:
         "workspace_initialized": "工作空间初始化",
         "work_prepared": "准备阶段工作",
         "artifact_submitted": "提交阶段产物",
-        "artifact_reviewed": "审核阶段产物",
-        "changes_requested": "请求修改产物",
+        "artifact_approved": "批准阶段产物",
+        "revision_requested": "请求修改产物",
         "question_opened": "提出阻塞问题",
         "decision_recorded": "记录人工决策",
-        "decision_routed": "路由人工决策",
-        "artifact_revised": "修订阶段产物",
-        "artifact_drift_resolved": "处理产物漂移",
-        "downstream_invalidated": "下游产物失效",
+        "artifact_reconciled": "核对阶段产物",
     }
     records = []
     for item in items:
@@ -1326,15 +1330,23 @@ def _status_tone(status: str) -> str:
     return {
         "approved": "ok",
         "accepted": "ok",
-        "implemented": "ok",
-        "tested": "ok",
+        "active": "ok",
+        "completed": "ok",
         "resolved": "ok",
         "review": "warn",
         "proposed": "warn",
-        "planned": "warn",
         "in_progress": "warn",
+        "ready": "warn",
+        "specification": "warn",
+        "implementation": "warn",
+        "testing": "warn",
         "changes_requested": "danger",
-        "stale": "danger",
+        "needs_reconcile": "warn",
+        "failed": "danger",
+        "skipped": "muted",
+        "not_run": "muted",
+        "optional": "muted",
+        "dependency_blocked": "danger",
         "open": "danger",
     }.get(status, "muted")
 

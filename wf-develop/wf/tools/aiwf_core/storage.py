@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 from .model import AIWorkflowError, SCHEMA_VERSION, now_iso, validate_document
-from .memory_view import render_memory
 
 DATA_FILES = (
     "project.json",
@@ -26,7 +25,6 @@ DATA_FILES = (
     "artifacts.json",
     "decisions.json",
     "questions.json",
-    "memory.json",
 )
 EVENTS_PATH = Path(".aiwf/events.jsonl")
 
@@ -116,13 +114,6 @@ class WorkspaceStore:
             "project.json": project_data,
             "state.json": {
                 "schema_version": SCHEMA_VERSION,
-                "current_stage": "analysis",
-                "mode": "ready",
-                "active_item": None,
-                "active_work": None,
-                "active_work_sha256": None,
-                "pending_reviews": [],
-                "blocking_questions": [],
                 "updated_at": timestamp,
             },
             "requirements.json": {"schema_version": SCHEMA_VERSION, "items": []},
@@ -130,7 +121,6 @@ class WorkspaceStore:
             "artifacts.json": {"schema_version": SCHEMA_VERSION, "items": []},
             "decisions.json": {"schema_version": SCHEMA_VERSION, "items": []},
             "questions.json": {"schema_version": SCHEMA_VERSION, "items": []},
-            "memory.json": {"schema_version": SCHEMA_VERSION, "items": []},
         }
         for name, document in initial_documents.items():
             validate_document(name, document)
@@ -169,13 +159,6 @@ class WorkspaceStore:
                 "data": {"project_id": project_data["project_id"]},
             }
             (temporary_root / "events.jsonl").write_bytes(json_line(event))
-            (temporary_root / "memory.md").write_text(
-                render_memory(
-                    initial_documents["memory.json"],
-                    initial_documents["decisions.json"],
-                ),
-                encoding="utf-8",
-            )
             (temporary_root / "workspace.lock").touch()
             for filename, content in copied_prd.items():
                 (temporary_prd / filename).write_bytes(content)
@@ -488,7 +471,6 @@ class WorkspaceStore:
                     details={"path": str(manifest_path), "status": status},
                 )
             shutil.rmtree(transaction_root)
-        self._cleanup_orphan_work_locked(recovered)
         return recovered
 
     def replace_generated_locked(self, relative_path: str | Path, content: bytes) -> None:
@@ -501,24 +483,6 @@ class WorkspaceStore:
                 details={"path": str(relative_path)},
             )
         self._atomic_write(target, content)
-
-    def _cleanup_orphan_work_locked(self, recovered: list[str]) -> None:
-        state_path = self.data_root / "state.json"
-        work_root = self.data_root / "work"
-        if not state_path.is_file() or not work_root.is_dir():
-            return
-        try:
-            state = validate_document(
-                "state.json",
-                json.loads(state_path.read_text(encoding="utf-8")),
-            )
-        except (OSError, json.JSONDecodeError):
-            return
-        active_work = state["active_work"]
-        for path in work_root.iterdir():
-            if path.is_dir() and path.name != active_work:
-                shutil.rmtree(path)
-                recovered.append(f"work:{path.name}:cleanup")
 
     def _validate_json_changes(self, changes: Mapping[str, bytes | None]) -> None:
         for relative_path, content in changes.items():

@@ -1,136 +1,92 @@
 ---
 name: wf
-description: 当用户在 AIWorkFlow 工作空间中要求继续或推进流程、分析需求、审核或修改产物、恢复事务、处理产物漂移、阻塞问题与决策时使用。
+description: 当用户在 AIWorkFlow 工作空间中要求继续或推进流程、分析需求、审核或修改产物、执行指定任务、处理问题或需求变化时使用。
 ---
 
 # 推进 AIWorkFlow
 
-以工作空间数据和任务包为事实源推进当前工作，不手工维护状态、编号、版本、依赖或记忆。
+工作流负责准备任务上下文、保存产物、记录审核和展示进度。主要精力放在需求理解、设计、任务拆解、代码实现和单元测试，不维护全局当前任务、Git 归属或影响传播协议。
 
 ## 定位内核
 
-解析当前 `SKILL.md` 的真实路径并定位：
+从当前 `SKILL.md` 定位 `tools/aiwf.py`。文件不存在时报告安装不完整，不回退到其他目录。
 
-```text
-<wf-skill-dir>/tools/aiwf.py
-```
-
-文件不存在时停止并报告安装不完整，不使用线上目录或旧工具作为回退。
-
-## 先读状态
-
-使用用户指定目录或当前目录调用：
+## 读取状态
 
 ```text
 python3 <aiwf.py> status --workspace <workspace>
 ```
 
-- `needs_recovery`：调用 `recover`，重新读取状态后继续原请求。
-- `review`：只处理用户对待审核 revision 的批准或修改意见。
-- `blocked`：只记录用户对开放问题的决定。
-- `decision`：根据已记录决定，明确继续当前工作或修订受影响的上游产物。
-- `working`：恢复同一个任务包。
-- `ready`：准备当前阶段任务。
+`needs_recovery` 时调用 `recover` 后重读。其他问题只按所属任务或产物处理，不因为无关任务待审核、待决定、测试失败或存在草稿而停止。
 
-状态返回 `not_initialized` 时停止。AIWorkFlow 不兼容旧格式工作空间；提示用户新建空目录并通过 `wf-init` 初始化，不读取或转换旧版状态文件。
+损坏的 work 会在 `issues` 中标明所属任务和产物。只暂停该产物并报告修复需求，用户仍可选择其他任务；不要为同一产物重复创建 work。
 
-`can_advance=false` 时停止正常推进，按照每项 issue 的 `recovery_action`、`allowed_outcomes` 和产物状态处理。不能执行的外部恢复动作或 `manual_repair_required` 直接报告用户，不绕过门禁。需要修订已批准产物但用户尚未授权修改时，先报告目标和原因并等待确认。可恢复的 `artifact_drift` 需要用户明确选择采纳还是放弃工作流外的正文修改，确认后调用：
+## 选择工作
+
+用户指定任务时，根据 `task_progress` 的 ID、标题和上下文匹配，并在内部调用：
 
 ```text
-python3 <aiwf.py> resolve-drift --workspace <workspace> --artifact-id <id> --revision <n> --outcome adopt --feedback <user-intent>
-python3 <aiwf.py> resolve-drift --workspace <workspace> --artifact-id <id> --revision <n> --outcome discard
+python3 <aiwf.py> prepare --workspace <workspace> --task-id <T-id> [--instruction <用户补充>]
 ```
 
-只有工具报告采纳会替换未完成 work，并且用户明确确认放弃该 work 时，才能追加 `--supersede-active-work`。结构化结果、work 或不可恢复的历史快照漂移直接报告，不手工猜测修复内容。
+不要要求用户输入命令或切换“当前任务”。用户未指定任务时可使用 `recommended_work`。推荐只是默认方向，不限制选择。
 
-## 准备和执行
+- 任务规格不受其他任务限制。
+- 代码实现只要求当前任务规格已批准，且 `depends_on` 中前置任务的实现已批准并且不处于 `needs_reconcile`。
+- 前置任务单元测试未执行、失败或跳过都不阻塞。
+- 单元测试是可选环节，不阻塞任务或项目实现完成。
+- 一个任务的草稿、审核或问题不阻塞其他任务。
 
-对继续、下一步或分析需求调用：
+`prepare` 返回已有同产物草稿时继续该草稿；不同任务的草稿可以并存。完整阅读任务包的 `stage_guide.instructions`、`facts`、`inputs` 和相关决定，只写 `draft_output`、`result_output` 以及实现所需代码。
 
-```text
-python3 <aiwf.py> prepare --workspace <workspace> [--task-id <T-id>] [--instruction <current-user-instruction>]
-```
+## 实现原则
 
-开始语义工作前，完整阅读并遵循任务包中的 `stage_guide.instructions`，再读取 `memory_context.content`、`inputs`、`facts` 和必要 `sources`。任务包已经内嵌当前阶段指南和本任务相关记忆，不要另行读取其他阶段指南或整个 `requirements.json`、`decisions.json`、`memory.md`、`history`、`events`。`target_platform` 始终给出目标平台，`facts` 始终存在，`facts.requirements` 在后续阶段表示当前有效需求投影。工具已经在 `result_output` 写入 `result_seed` 作为待填写起点；完成后的内容必须符合 `result_schema`，不阅读内核代码推断格式。遵循任务包目标与边界，自主分析需求；只写 `draft_output` 和 `result_output`，不要直接修改正式产物或其他 `.aiwf` 数据。
-任务阶段默认由引擎选择下一个可处理任务；只有用户明确指定任务时才传 `--task-id`。
+执行代码任务时先检查当前代码已经满足哪些验收标准，只补齐缺口。其他任务顺带完成的代码直接复用；若当前任务已经全部实现，允许零代码变化报告。
 
-判断信息时区分来源：目标行为按“最新用户确认 > PRD > Agent 推断”，代码现状按“仓库证据 > PRD 或口述”，平台能力按“官方文档或实际验证 > 推断”。需求未规定的局部实现细节由 Agent 自主决定；长期保留时写为 `engineering_default`，同时给出理由和验证点，不伪装成已确认业务事实。
+代码目录不可访问是状态提示，不是全局流程门禁。只有当前工作确实需要读取或修改代码时才停止并说明；`submit` 只注册已经完成的产物，不额外检查代码目录。
 
-最新用户反馈或当前产物明确替代 `memory_context.content` 中的旧决策时，在结果的 `superseded_decisions` 登记对应 `D-id`；只有产物审核通过后旧决策才会退出当前记忆。不要为了缩短上下文而失效仍然有效的决定。
+任务规格在 `acceptance_criteria` 中保存验收标准。实现结果必须逐项对应这些标准，记录 `summary`、验收结论、证据和至少一项实际验证，全部通过后才能提交。`changed_files` 与 `test_files` 仅作报告，不与 Git 状态比较，也不限制生产代码和测试代码的修改时机。
 
-`memory_delta` 只记录确实需要跨阶段复用的信息：`repository_fact` 必须带文件与符号证据，`architecture_decision` 必须带理由，`engineering_default` 必须带理由和验证点，`validation_item` 必须说明验证方式。短期思考过程和产物正文摘要不要写入长期记忆。
-
-执行中若仓库证据证明已批准上游产物包含客观事实错误，选择最早出现错误的已批准上游 revision，并调用：
-
-```text
-python3 <aiwf.py> route-upstream --workspace <workspace> --work-id <work-id> --artifact-id <id> --revision <n> --correction <factual-correction> --evidence-json <[{"path":"...","symbol":"..."}]>
-```
-
-该命令只用于可由代码仓库验证的事实纠正，会归档当前 work 并创建上游 revision work。需求范围、目标行为、架构取舍或公开承诺发生变化时不得使用；按“阻塞问题与决定”记录问题，由用户决定后走 `route-decision`。
-
-完成后调用：
+## 提交与审核
 
 ```text
-python3 <aiwf.py> submit --workspace <workspace> --work-id <work-id>
-```
-
-报告产物与 revision，等待用户审核，不自行批准。
-
-## 审核与修改
-
-用户明确批准唯一待审核产物时调用：
-
-```text
+python3 <aiwf.py> submit --workspace <workspace> --work-id <W-id>
 python3 <aiwf.py> review --workspace <workspace> --artifact-id <id> --revision <n> --outcome approved
+python3 <aiwf.py> review --workspace <workspace> --artifact-id <id> --revision <n> --outcome changes_requested --feedback <反馈>
 ```
 
-用户要求修改时保留反馈原文并调用：
+提交后报告具体产物并等待用户审核，不自行批准。审核只改变该产物，不阻塞其他任务。
+
+修改已批准产物时调用 `revise`。人工直接修改 Markdown 视为该产物的新草稿来源；批准前仍使用上一个已批准结构化结果，不触发漂移门禁。
+
+## 需求变化
+
+需求和任务使用稳定 ID。批准修订后，引擎只把直接关联任务的已有产物标记为 `needs_reconcile`，不递归传播，也不影响无关任务。
+
+处理待核对产物时：
+
+- 确需修改：用 `revise` 只更新必要内容。
+- 当前内容仍满足最新需求：记录核对结论并清除标记。
 
 ```text
-python3 <aiwf.py> review --workspace <workspace> --artifact-id <id> --revision <n> --outcome changes_requested --feedback <feedback>
+python3 <aiwf.py> reconcile --workspace <workspace> --artifact-id <id> --revision <n> --note <核对结论>
 ```
 
-修改请求会创建带原草稿和反馈的新任务包；继续完成该任务包并再次提交。
+## 问题与决定
 
-用户要求修改已批准产物时调用：
+只有当前工作缺少关键业务答案时提交问题。问题只需 `question`、`reason` 和 `recommendation`：
 
 ```text
-python3 <aiwf.py> revise --workspace <workspace> --artifact-id <id> --revision <n> --feedback <feedback>
+python3 <aiwf.py> question --workspace <workspace> --work-id <W-id> --items-json <json-array>
+python3 <aiwf.py> decide --workspace <workspace> --question-id <Q-id> --decision <用户原话>
 ```
 
-存在其他未完成 work 时不得自行覆盖。向用户说明冲突；只有用户明确确认放弃当前 work 后，才追加 `--supersede-active-work`，由引擎归档原草稿。
-
-## 阻塞问题与决定
-
-阶段指南判定必须停止时，一次提交本轮全部阻塞问题。每项包含 `question`、`reason`、`recommendation` 和提问时预估的受影响阶段 `impact`：
-
-```text
-python3 <aiwf.py> question --workspace <workspace> --work-id <work-id> --items-json <json-array>
-```
-
-用户回答后逐项原样记录：
-
-```text
-python3 <aiwf.py> decide --workspace <workspace> --question-id <Q-id> --decision <user-decision>
-```
-
-不要替用户补全尚未回答的选择。全部问题解决后，状态进入 `decision`。如果决定只是澄清当前工作，调用：
-
-```text
-python3 <aiwf.py> route-decision --workspace <workspace> --work-id <work-id> --outcome resume
-```
-
-如果决定改变了已批准的上游需求、设计或规格，选择真正需要修改的最上游产物并调用：
-
-```text
-python3 <aiwf.py> route-decision --workspace <workspace> --work-id <work-id> --outcome revise --artifact-id <id> --revision <n>
-```
-
-修订目标必须是任务包的已批准上游依赖。`impact` 是提问时的预估，用户回答扩大影响时选择实际需要修改的最上游产物；只有用户决定明确要求改变上游时才选择 `revise`。引擎会归档当前 work、创建 revision work，并记录预估范围与实际路由。
+回答后原工作自动恢复，不需要决策路由。开放问题只暂停所属工作，用户仍可执行其他任务。
+同一 work 后续仍可按实际需要继续提问；每次决定都会进入该 work 的 `decision_context`。
 
 ## 恢复
 
-状态返回 `needs_recovery` 时调用：
+只有未完成的原子写事务需要全局恢复：
 
 ```text
 python3 <aiwf.py> recover --workspace <workspace>

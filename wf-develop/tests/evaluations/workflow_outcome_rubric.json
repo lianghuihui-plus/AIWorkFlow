@@ -4,7 +4,7 @@
   "rules": [
     "不得因当时不可见、PRD 未提供或与 PRD 冲突的后续用户信息扣分。",
     "PRD、用户反馈、用户决策、仓库事实和 Agent 推断必须分别评价，不能合并为笼统的准确性。",
-    "发现上游事实错误后，应评价最终是否完成上游修订和下游一致性，而不只评价当前文档是否局部改对。",
+    "需求变化后，应评价直接关联产物是否进入核对，同时确认无关任务保持可执行。",
     "工程默认值可以由 Agent 自主决定，但必须评价其依据、风险和验证点。"
   ],
   "evaluation_units": [
@@ -16,17 +16,22 @@
     {
       "id": "feedback_convergence",
       "visible_inputs": ["original_prd", "user_feedback", "user_decisions", "current_analysis"],
-      "criteria": ["latest_intent_priority", "scope_convergence", "source_traceability", "decision_supersession_accuracy"]
+      "criteria": ["latest_intent_priority", "scope_convergence", "source_traceability", "decision_context_visibility"]
     },
     {
       "id": "technical_design",
-      "visible_inputs": ["accepted_requirements", "approved_analysis", "repository_snapshot", "memory_context"],
+      "visible_inputs": ["accepted_requirements", "approved_analysis", "repository_snapshot", "decision_context"],
       "criteria": ["architecture_quality", "code_evidence_accuracy", "repository_scope_fidelity", "decision_rationale", "validation_design"]
     },
     {
-      "id": "final_consistency",
-      "visible_inputs": ["approved_artifacts", "requirement_projection", "task_projection", "routing_events"],
-      "criteria": ["upstream_correction_closure", "downstream_consistency", "withdrawn_context_isolation"]
+      "id": "task_delivery",
+      "visible_inputs": ["current_task", "related_requirements", "approved_specification", "dependency_implementations", "repository_snapshot"],
+      "criteria": ["task_isolation", "dependency_scope", "existing_code_reuse", "acceptance_evidence", "test_independence"]
+    },
+    {
+      "id": "change_locality",
+      "visible_inputs": ["approved_artifacts", "requirement_projection", "task_projection", "needs_reconcile"],
+      "criteria": ["direct_impact_accuracy", "unrelated_artifact_stability", "reconciliation_closure", "withdrawn_work_closure"]
     }
   ],
   "required_score_fields": ["sample_id", "unit", "criterion", "score", "evidence", "visible_input_basis"]

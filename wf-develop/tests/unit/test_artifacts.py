@@ -5,8 +5,11 @@ import unittest
 import support  # noqa: F401
 
 from aiwf_core.artifacts import (
+    reconcile_requirements,
     reconcile_tasks,
+    requirement_semantic_value,
     result_seed_from_record,
+    semantic_digest,
     validate_design_coverage,
     validate_result_manifest,
 )
@@ -14,6 +17,164 @@ from aiwf_core.model import AIWorkflowError, SCHEMA_VERSION
 
 
 class ArtifactResultTests(unittest.TestCase):
+    def test_result_manifest_rejects_deprecated_top_level_fields(self) -> None:
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "stage": "testing",
+            "task_id": "T-001",
+            "status": "completed",
+            "test_files": [],
+            "command": None,
+            "summary": "Tests passed.",
+            "uncovered": [],
+            "memory_delta": [],
+        }
+
+        with self.assertRaises(AIWorkflowError) as raised:
+            validate_result_manifest("testing", result, active_item="T-001")
+
+        self.assertEqual(raised.exception.code, "invalid_schema")
+
+    def test_existing_requirement_revision_requires_change_kind(self) -> None:
+        current = {
+            "schema_version": SCHEMA_VERSION,
+            "items": [
+                {
+                    "id": "REQ-001",
+                    "title": "Save drafts",
+                    "summary": "Persist drafts.",
+                    "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                    "platform_scope": "target",
+                    "change_type": "new",
+                    "scope_reason": "Target behavior.",
+                    "disposition": "accepted",
+                    "origin_revision": 1,
+                    "revision": 1,
+                    "approved_revision": 1,
+                    "semantic_sha256": "1" * 64,
+                    "content_sha256": "2" * 64,
+                }
+            ],
+        }
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "stage": "analysis",
+            "target_platform": "test",
+            "requirements": [
+                {
+                    "id": "REQ-001",
+                    "title": "Save drafts",
+                    "summary": "Persist drafts for 30 days.",
+                    "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                    "platform_scope": "target",
+                    "change_type": "modify",
+                    "scope_reason": "Retention changed.",
+                    "disposition": "proposed",
+                }
+            ],
+            "withdrawn_requirements": [],
+        }
+
+        with self.assertRaises(AIWorkflowError) as raised:
+            reconcile_requirements(current, result, revision=2)
+
+        self.assertEqual(raised.exception.code, "invalid_schema")
+
+    def test_presentation_change_preserves_requirement_semantics(self) -> None:
+        current = {
+            "schema_version": SCHEMA_VERSION,
+            "items": [
+                {
+                    "id": "REQ-001",
+                    "title": "Save drafts",
+                    "summary": "Persist drafts.",
+                    "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                    "platform_scope": "target",
+                    "change_type": "new",
+                    "scope_reason": "Target behavior.",
+                    "disposition": "accepted",
+                    "origin_revision": 1,
+                    "revision": 1,
+                    "approved_revision": 1,
+                    "semantic_sha256": "1" * 64,
+                    "content_sha256": "2" * 64,
+                }
+            ],
+        }
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "stage": "analysis",
+            "target_platform": "test",
+            "requirements": [
+                {
+                    "id": "REQ-001",
+                    "change_kind": "presentation",
+                    "title": "Draft saving",
+                    "summary": "Persist drafts.",
+                    "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                    "platform_scope": "target",
+                    "change_type": "new",
+                    "scope_reason": "Wording clarified.",
+                    "disposition": "proposed",
+                }
+            ],
+            "withdrawn_requirements": [],
+        }
+
+        updated, normalized = reconcile_requirements(current, result, revision=2)
+
+        self.assertEqual(updated["items"][0]["semantic_sha256"], "1" * 64)
+        self.assertEqual(normalized["requirements"][0]["change_kind"], "presentation")
+
+    def test_behavior_change_advances_requirement_semantics(self) -> None:
+        requirement = {
+            "id": "REQ-001",
+            "title": "Save drafts",
+            "summary": "Persist drafts.",
+            "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+            "platform_scope": "target",
+            "change_type": "new",
+            "scope_reason": "Target behavior.",
+            "disposition": "accepted",
+            "origin_revision": 1,
+            "revision": 1,
+            "approved_revision": 1,
+            "content_sha256": "2" * 64,
+        }
+        requirement["semantic_sha256"] = semantic_digest(
+            requirement_semantic_value(requirement)
+        )
+        current = {
+            "schema_version": SCHEMA_VERSION,
+            "items": [requirement],
+        }
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "stage": "analysis",
+            "target_platform": "test",
+            "requirements": [
+                {
+                    "id": "REQ-001",
+                    "change_kind": "behavior",
+                    "title": "Draft saving",
+                    "summary": "Persist drafts for 30 days.",
+                    "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
+                    "platform_scope": "target",
+                    "change_type": "modify",
+                    "scope_reason": "Retention changed.",
+                    "disposition": "proposed",
+                }
+            ],
+            "withdrawn_requirements": [],
+        }
+
+        updated, _ = reconcile_requirements(current, result, revision=2)
+
+        self.assertNotEqual(
+            updated["items"][0]["semantic_sha256"],
+            requirement["semantic_sha256"],
+        )
+
     def test_analysis_requires_structured_sources(self) -> None:
         result = {
             "schema_version": SCHEMA_VERSION,
@@ -30,7 +191,6 @@ class ArtifactResultTests(unittest.TestCase):
                     "disposition": "proposed",
                 }
             ],
-            "memory_delta": [],
         }
 
         with self.assertRaises(AIWorkflowError) as raised:
@@ -38,29 +198,30 @@ class ArtifactResultTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "invalid_schema")
 
-    def test_memory_type_contracts_are_enforced(self) -> None:
+    def test_implementation_requires_all_acceptance_criteria_to_pass(self) -> None:
         result = {
             "schema_version": SCHEMA_VERSION,
-            "stage": "specification",
+            "stage": "implementation",
             "task_id": "T-001",
-            "memory_delta": [
+            "summary": "Draft restore remains incomplete.",
+            "changed_files": [],
+            "acceptance_results": [
                 {
-                    "operation": "add",
-                    "type": "engineering_default",
-                    "content": "Use the repository default timeout.",
-                    "evidence": [],
-                    "rationale": "Matches the surrounding module.",
-                    "validation": None,
+                    "criterion": "Draft can be restored",
+                    "status": "failed",
+                    "evidence": "Restore path is missing.",
                 }
             ],
+            "validation": ["Checked the restore path."],
+            "risks": ["Restore remains unavailable."],
         }
 
         with self.assertRaises(AIWorkflowError) as raised:
-            validate_result_manifest("specification", result, active_item="T-001")
+            validate_result_manifest("implementation", result, active_item="T-001")
 
-        self.assertIn("engineering_default requires validation", raised.exception.message)
+        self.assertEqual(raised.exception.code, "acceptance_not_met")
 
-    def test_testing_result_rejects_boolean_exit_code(self) -> None:
+    def test_testing_result_requires_an_explicit_status(self) -> None:
         with self.assertRaises(AIWorkflowError) as raised:
             validate_result_manifest(
                 "testing",
@@ -68,9 +229,9 @@ class ArtifactResultTests(unittest.TestCase):
                     "schema_version": SCHEMA_VERSION,
                     "stage": "testing",
                     "task_id": "T-001",
-                    "memory_delta": [],
                     "test_files": [],
-                    "execution": {"command": None, "exit_code": True, "summary": ""},
+                    "command": None,
+                    "summary": "No environment.",
                     "uncovered": [],
                 },
                 active_item="T-001",
@@ -78,22 +239,11 @@ class ArtifactResultTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "invalid_schema")
 
-    def test_result_seed_removes_engine_fields_and_applied_memory_delta(self) -> None:
+    def test_result_seed_removes_engine_fields(self) -> None:
         record = {
             "schema_version": SCHEMA_VERSION,
             "stage": "analysis",
             "target_platform": "web",
-            "superseded_decisions": ["D-001"],
-            "memory_delta": [
-                {
-                    "operation": "add",
-                    "type": "architecture_decision",
-                    "content": "Users save drafts.",
-                    "evidence": [],
-                    "rationale": "Confirmed by analysis.",
-                    "validation": None,
-                }
-            ],
             "requirements": [
                 {
                     "id": "REQ-001",
@@ -112,21 +262,17 @@ class ArtifactResultTests(unittest.TestCase):
             "revision": 1,
         }
 
-        seed = result_seed_from_record(
-            "analysis", record, preserve_memory_delta=False
-        )
+        seed = result_seed_from_record("analysis", record)
 
-        self.assertEqual(seed["memory_delta"], [])
-        self.assertEqual(seed["superseded_decisions"], [])
         self.assertNotIn("artifact_id", seed)
-        self.assertNotIn("origin_revision", seed["requirements"][0])
+        self.assertEqual(seed["requirements"], [])
+        self.assertEqual(seed["withdrawn_requirements"], [])
 
-    def test_analysis_revision_seed_restores_agent_inference_self_reference(self) -> None:
+    def test_analysis_revision_seed_is_an_explicit_empty_patch(self) -> None:
         record = {
             "schema_version": SCHEMA_VERSION,
             "stage": "analysis",
             "target_platform": "web",
-            "memory_delta": [],
             "requirements": [
                 {
                     "id": "REQ-001",
@@ -142,56 +288,17 @@ class ArtifactResultTests(unittest.TestCase):
             ],
         }
 
-        seed = result_seed_from_record(
-            "analysis", record, preserve_memory_delta=False
-        )
+        seed = result_seed_from_record("analysis", record)
 
-        self.assertEqual(seed["requirements"][0]["sources"][0]["ref"], "self")
+        self.assertEqual(seed["requirements"], [])
+        self.assertEqual(seed["withdrawn_requirements"], [])
         validate_result_manifest("analysis", seed, active_item=None)
-
-    def test_unapproved_result_seed_preserves_candidate_memory_delta(self) -> None:
-        record = {
-            "schema_version": SCHEMA_VERSION,
-            "stage": "analysis",
-            "target_platform": "web",
-            "memory_delta": [
-                {
-                    "operation": "add",
-                    "type": "architecture_decision",
-                    "content": "Users save drafts.",
-                    "evidence": [],
-                    "rationale": "Confirmed by analysis.",
-                    "validation": None,
-                }
-            ],
-            "requirements": [
-                {
-                    "id": "REQ-001",
-                    "title": "Save a draft",
-                    "summary": "Users save drafts.",
-                    "sources": [{"kind": "prd", "ref": "prd/requirements.md"}],
-                    "platform_scope": "target",
-                    "change_type": "new",
-                    "scope_reason": "Implemented by the web client.",
-                    "disposition": "proposed",
-                    "origin_revision": 1,
-                }
-            ],
-        }
-
-        seed = result_seed_from_record(
-            "analysis", record, preserve_memory_delta=True
-        )
-
-        self.assertEqual(seed["memory_delta"], record["memory_delta"])
-        self.assertNotIn("origin_revision", seed["requirements"][0])
 
     def test_result_manifest_rejects_nested_engine_fields(self) -> None:
         result = {
             "schema_version": SCHEMA_VERSION,
             "stage": "analysis",
             "target_platform": "web",
-            "memory_delta": [],
             "requirements": [
                 {
                     "id": "REQ-001",
@@ -220,7 +327,6 @@ class ArtifactResultTests(unittest.TestCase):
                 "schema_version": SCHEMA_VERSION,
                 "stage": "analysis",
                 "target_platform": "web",
-                "memory_delta": [],
                 "requirements": [
                     {
                         "title": "Native-only capability",
@@ -236,26 +342,33 @@ class ArtifactResultTests(unittest.TestCase):
             active_item=None,
         )
 
-    def test_analysis_rejects_an_empty_requirement_set(self) -> None:
-        with self.assertRaises(AIWorkflowError):
-            validate_result_manifest(
-                "analysis",
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "stage": "analysis",
-                    "target_platform": "web",
-                    "memory_delta": [],
-                    "requirements": [],
-                },
-                active_item=None,
+    def test_analysis_rejects_an_empty_effective_requirement_set(self) -> None:
+        result = validate_result_manifest(
+            "analysis",
+            {
+                "schema_version": SCHEMA_VERSION,
+                "stage": "analysis",
+                "target_platform": "web",
+                "requirements": [],
+                "withdrawn_requirements": [],
+            },
+            active_item=None,
+        )
+
+        with self.assertRaises(AIWorkflowError) as raised:
+            reconcile_requirements(
+                {"schema_version": SCHEMA_VERSION, "items": []},
+                result,
+                revision=1,
             )
+
+        self.assertEqual(raised.exception.code, "empty_requirements")
 
     def test_analysis_result_rejects_an_unsupported_disposition(self) -> None:
         result = {
             "schema_version": SCHEMA_VERSION,
             "stage": "analysis",
             "target_platform": "web",
-            "memory_delta": [],
             "requirements": [
                 {
                     "title": "Unresolved",
@@ -278,7 +391,6 @@ class ArtifactResultTests(unittest.TestCase):
         result = {
             "schema_version": SCHEMA_VERSION,
             "stage": "specification",
-            "memory_delta": [],
             "tasks": [
                 {
                     "key": "base",
@@ -322,7 +434,6 @@ class ArtifactResultTests(unittest.TestCase):
         empty_reference = {
             "schema_version": SCHEMA_VERSION,
             "stage": "specification",
-            "memory_delta": [],
             "tasks": [
                 {
                     "key": "drafts",
@@ -396,7 +507,6 @@ class ArtifactResultTests(unittest.TestCase):
         result = {
             "schema_version": SCHEMA_VERSION,
             "stage": "specification",
-            "memory_delta": [],
             "tasks": [
                 {
                     "key": "now",
@@ -420,7 +530,6 @@ class ArtifactResultTests(unittest.TestCase):
         result = {
             "schema_version": SCHEMA_VERSION,
             "stage": "specification",
-            "memory_delta": [],
             "tasks": [
                 {
                     "key": "a",
@@ -468,7 +577,7 @@ class ArtifactResultTests(unittest.TestCase):
                     "title": "Base",
                     "requirements": ["REQ-001"],
                     "depends_on": [],
-                    "status": "planned",
+                    "status": "active",
                     "origin_revision": 1,
                 },
                 {
@@ -476,7 +585,7 @@ class ArtifactResultTests(unittest.TestCase):
                     "title": "Dependent",
                     "requirements": ["REQ-001"],
                     "depends_on": ["T-001"],
-                    "status": "planned",
+                    "status": "active",
                     "origin_revision": 1,
                 },
             ],
@@ -497,7 +606,6 @@ class ArtifactResultTests(unittest.TestCase):
         revision = {
             "schema_version": SCHEMA_VERSION,
             "stage": "specification",
-            "memory_delta": [],
             "tasks": [
                 {
                     "key": "dependent",
@@ -507,6 +615,7 @@ class ArtifactResultTests(unittest.TestCase):
                     "depends_on": ["T-001"],
                 }
             ],
+            "withdrawn_tasks": ["T-001"],
         }
 
         with self.assertRaises(AIWorkflowError) as raised:
@@ -551,7 +660,6 @@ class ArtifactResultTests(unittest.TestCase):
             "code_evidence": [
                 {"path": "src/app.py", "symbol": "DraftStore", "purpose": "Draft persistence"}
             ],
-            "memory_delta": [],
         }
 
         validate_result_manifest("design", valid, active_item=None)
@@ -581,7 +689,6 @@ class ArtifactResultTests(unittest.TestCase):
                     "disposition": "proposed",
                 }
             ],
-            "memory_delta": [],
         }
 
         with self.assertRaises(AIWorkflowError) as raised:
