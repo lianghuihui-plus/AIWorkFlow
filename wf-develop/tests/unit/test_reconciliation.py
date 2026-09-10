@@ -99,7 +99,7 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(title_only_design, [])
         self.assertEqual(behavior_change_during_task_plan, [])
         self.assertEqual(unrelated_task_plan_revision, [])
-    def test_new_requirement_marks_only_task_plan(self) -> None:
+    def test_new_requirement_marks_design_and_task_plan(self) -> None:
         artifacts = {
             "schema_version": 11,
             "items": [artifact("design"), artifact("task-plan")],
@@ -117,14 +117,15 @@ class ReconciliationTests(unittest.TestCase):
         )
 
         by_id = {item["id"]: item for item in updated["items"]}
-        self.assertEqual(affected, ["task-plan"])
-        self.assertEqual(by_id["design"]["needs_reconcile"], [])
+        self.assertEqual(affected, ["design", "task-plan"])
+        self.assertEqual(by_id["design"]["needs_reconcile"], ["requirement:REQ-001"])
 
     def test_requirement_change_marks_only_direct_task_artifacts(self) -> None:
         artifacts = {
             "schema_version": 11,
             "items": [
                 artifact("design"),
+                artifact("task-plan"),
                 artifact("T-001-spec", "T-001"),
                 artifact("T-001-implementation", "T-001"),
                 artifact("T-002-spec", "T-002"),
@@ -151,10 +152,11 @@ class ReconciliationTests(unittest.TestCase):
 
         by_id = {item["id"]: item for item in updated["items"]}
         self.assertEqual(affected, ["T-001-implementation", "T-001-spec", "design"])
+        self.assertEqual(by_id["task-plan"]["needs_reconcile"], [])
         self.assertEqual(by_id["T-002-spec"]["needs_reconcile"], [])
         self.assertEqual(by_id["T-001-spec"]["needs_reconcile"], ["requirement:REQ-001"])
 
-    def test_existing_requirement_entering_scope_marks_only_task_plan(self) -> None:
+    def test_existing_requirement_entering_scope_marks_design_and_task_plan(self) -> None:
         artifacts = {
             "schema_version": 11,
             "items": [
@@ -178,8 +180,8 @@ class ReconciliationTests(unittest.TestCase):
         )
 
         by_id = {item["id"]: item for item in updated["items"]}
-        self.assertEqual(affected, ["task-plan"])
-        self.assertEqual(by_id["design"]["needs_reconcile"], [])
+        self.assertEqual(affected, ["design", "task-plan"])
+        self.assertEqual(by_id["design"]["needs_reconcile"], ["requirement:REQ-001"])
         self.assertEqual(by_id["T-001-spec"]["needs_reconcile"], [])
 
     def test_new_requirement_outside_implementation_scope_changes_nothing(self) -> None:
@@ -203,7 +205,7 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(affected, [])
         self.assertTrue(all(not item["needs_reconcile"] for item in updated["items"]))
 
-    def test_requirement_leaving_scope_marks_design_and_direct_task_only(self) -> None:
+    def test_requirement_leaving_scope_marks_project_artifacts_and_direct_task_only(self) -> None:
         artifacts = {
             "schema_version": 11,
             "items": [
@@ -231,9 +233,39 @@ class ReconciliationTests(unittest.TestCase):
         )
 
         by_id = {item["id"]: item for item in updated["items"]}
-        self.assertEqual(affected, ["T-001-spec", "design"])
-        self.assertEqual(by_id["task-plan"]["needs_reconcile"], [])
+        self.assertEqual(affected, ["T-001-spec", "design", "task-plan"])
+        self.assertEqual(by_id["task-plan"]["needs_reconcile"], ["requirement:REQ-001"])
         self.assertEqual(by_id["T-002-spec"]["needs_reconcile"], [])
+
+    def test_implementation_revision_marks_only_own_test_and_direct_consumers(self) -> None:
+        artifacts = {
+            "schema_version": 11,
+            "items": [
+                artifact("T-001-test", "T-001"),
+                artifact("T-002-implementation", "T-002"),
+                artifact("T-002-test", "T-002"),
+                artifact("T-003-implementation", "T-003"),
+            ],
+        }
+        tasks = [
+            {"id": "T-001", "status": "active", "depends_on": []},
+            {"id": "T-002", "status": "active", "depends_on": ["T-001"]},
+            {"id": "T-003", "status": "active", "depends_on": ["T-002"]},
+        ]
+
+        updated, affected = mark_direct_reconciliation(
+            artifacts,
+            stage="implementation",
+            active_item="T-001",
+            after_tasks=tasks,
+        )
+
+        by_id = {item["id"]: item for item in updated["items"]}
+        self.assertEqual(
+            affected,
+            ["T-001-test", "T-002-implementation", "T-002-test"],
+        )
+        self.assertEqual(by_id["T-003-implementation"]["needs_reconcile"], [])
 
     def test_reconciliation_clear_preserves_approval(self) -> None:
         document = {"schema_version": 11, "items": [{**artifact("T-001-spec"), "needs_reconcile": ["requirement:REQ-001"]}]}

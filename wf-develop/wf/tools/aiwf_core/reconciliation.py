@@ -52,7 +52,7 @@ def requirement_change_sets(
         if _requirement_behavior_digest(before_by_id[item_id])
         != _requirement_behavior_digest(after_by_id[item_id])
     }.union(scope_removed)
-    return scope_added, behavior_changes
+    return scope_added.union(scope_removed), behavior_changes
 
 
 def mark_direct_reconciliation(
@@ -69,16 +69,17 @@ def mark_direct_reconciliation(
     reasons_by_artifact: dict[str, set[str]] = {}
 
     if stage == "analysis":
-        scope_added, behavior_changes = requirement_change_sets(
+        scope_changes, behavior_changes = requirement_change_sets(
             before_requirements, after_requirements
         )
-        if scope_added:
+        if scope_changes:
             reasons_by_artifact.setdefault("task-plan", set()).update(
-                f"requirement:{item_id}" for item_id in scope_added
+                f"requirement:{item_id}" for item_id in scope_changes
             )
-        if behavior_changes:
+        project_design_changes = scope_changes.union(behavior_changes)
+        if project_design_changes:
             reasons_by_artifact.setdefault("design", set()).update(
-                f"requirement:{item_id}" for item_id in behavior_changes
+                f"requirement:{item_id}" for item_id in project_design_changes
             )
         before_task_items = list(before_tasks)
         for task in before_task_items:
@@ -107,6 +108,15 @@ def mark_direct_reconciliation(
         reasons_by_artifact.setdefault(f"{active_item}-test", set()).add(
             f"implementation:{active_item}"
         )
+        for task in after_tasks:
+            if (
+                task.get("status") == "active"
+                and active_item in task.get("depends_on", [])
+            ):
+                for suffix in ("implementation", "test"):
+                    reasons_by_artifact.setdefault(
+                        f"{task['id']}-{suffix}", set()
+                    ).add(f"dependency:{active_item}")
 
     changed_artifacts: list[str] = []
     items: list[dict[str, Any]] = []
@@ -122,18 +132,11 @@ def mark_direct_reconciliation(
     return {"schema_version": SCHEMA_VERSION, "items": items}, sorted(changed_artifacts)
 
 
-def _requirement_behavior(item: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        key: item.get(key)
-        for key in ("summary", "platform_scope", "change_type")
-    }
-
-
 def _requirement_behavior_digest(item: Mapping[str, Any]) -> str:
     stored = item.get("semantic_sha256")
     if isinstance(stored, str):
         return stored
-    return semantic_digest(_requirement_behavior(item))
+    return semantic_digest(requirement_semantic_value(item))
 
 
 def clear_reconciliation(

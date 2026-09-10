@@ -116,16 +116,6 @@ def derive_task_flow(
     )
 
 
-def derive_task_progress(
-    *, tasks: Mapping[str, Any], artifacts: Mapping[str, Any]
-) -> list[dict[str, Any]]:
-    return _task_progress(
-        tasks["items"],
-        {item["id"]: item for item in artifacts["items"]},
-        {},
-    )
-
-
 def select_work(projection: Mapping[str, Any], task_id: str | None) -> dict[str, Any]:
     if task_id is None:
         recommended = projection.get("recommended_work")

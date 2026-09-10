@@ -200,7 +200,7 @@ def result_schema(stage: str, active_item: str | None = None) -> dict[str, Any]:
         properties["withdrawn_requirements"] = string_array
         required.extend(("target_platform", "requirements"))
     elif stage == "design":
-        properties["requirements"] = {**string_array, "minItems": 1}
+        properties["requirements"] = string_array
         properties["design_mode"] = {"enum": ["anchored", "greenfield"]}
         properties["greenfield_reason"] = {"type": ["string", "null"]}
         properties["code_evidence"] = {

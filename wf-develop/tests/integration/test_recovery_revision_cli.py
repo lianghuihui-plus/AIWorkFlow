@@ -369,11 +369,69 @@ class ReconciliationIntegrationTests(unittest.TestCase):
             )
 
             status = engine.inspect()
-            self.assertEqual(approved["needs_reconcile"], ["task-plan"])
-            self.assertEqual(status["recommended_work"]["artifact_id"], "task-plan")
-            self.assertEqual(status["next_action"], "plan_tasks")
+            self.assertEqual(approved["needs_reconcile"], ["design", "task-plan"])
+            self.assertEqual(status["recommended_work"]["artifact_id"], "design")
+            self.assertEqual(status["next_action"], "design_solution")
             unrelated = engine.prepare_work(active_item="T-002")
             self.assertEqual(unrelated["stage"], "specification")
+
+    def test_implementation_revision_marks_only_direct_task_consumers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            advance_to_tasks(
+                engine,
+                [
+                    {"key": "a", "title": "A", "requirements": ["REQ-001"], "depends_on": []},
+                    {"key": "b", "title": "B", "requirements": ["REQ-001"], "depends_on": ["a"]},
+                    {"key": "c", "title": "C", "requirements": ["REQ-001"], "depends_on": []},
+                ],
+            )
+            for task_id in ("T-001", "T-002", "T-003"):
+                approve_task_spec(engine, task_id)
+            for task_id in ("T-001", "T-002", "T-003"):
+                approve_task_implementation(engine, task_id)
+
+            revision = engine.request_revision(
+                "T-001-implementation",
+                1,
+                feedback="Update A's implementation contract.",
+            )
+            write_work_outputs(
+                engine,
+                revision,
+                markdown="# T-001 implementation\n\nUpdated contract verified.\n",
+                result={
+                    "schema_version": 11,
+                    "stage": "implementation",
+                    "task_id": "T-001",
+                    "summary": "The updated task behavior is available.",
+                    "changed_files": [],
+                    "acceptance_results": [
+                        {
+                            "criterion": "Behavior is available",
+                            "status": "passed",
+                            "evidence": "The updated contract was inspected.",
+                        }
+                    ],
+                    "validation": ["Targeted verification passed."],
+                    "risks": [],
+                },
+            )
+            submitted = engine.submit_work(str(revision["work_id"]))
+            engine.review_artifact(
+                "T-001-implementation",
+                int(submitted["revision"]),
+                outcome="approved",
+            )
+
+            by_id = {
+                item["id"]: item
+                for item in engine.store.read_json("artifacts.json")["items"]
+            }
+            self.assertTrue(by_id["T-002-implementation"]["needs_reconcile"])
+            self.assertFalse(by_id["T-003-implementation"]["needs_reconcile"])
 
     def test_requirement_change_marks_only_related_task_and_real_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

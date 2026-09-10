@@ -673,6 +673,23 @@ class ArtifactResultTests(unittest.TestCase):
         self.assertEqual(raised.exception.details["unknown"], ["REQ-002"])
         self.assertEqual(raised.exception.details["missing"], ["REQ-001"])
 
+    def test_design_can_cover_an_empty_accepted_scope(self) -> None:
+        requirements = {
+            "schema_version": SCHEMA_VERSION,
+            "items": [],
+        }
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "stage": "design",
+            "requirements": [],
+            "design_mode": "greenfield",
+            "greenfield_reason": "No requirements are currently accepted.",
+            "code_evidence": [],
+        }
+
+        validate_result_manifest("design", result, active_item=None)
+        validate_design_coverage(requirements, result)
+
     def test_analysis_rejects_other_platform_work_as_proposed(self) -> None:
         result = {
             "schema_version": SCHEMA_VERSION,

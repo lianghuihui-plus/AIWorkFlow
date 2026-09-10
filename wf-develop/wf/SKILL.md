@@ -37,7 +37,7 @@ python3 <aiwf.py> prepare --workspace <workspace> --task-id <T-id> [--instructio
 - 单元测试是可选环节，不阻塞任务或项目实现完成。
 - 一个任务的草稿、审核或问题不阻塞其他任务。
 
-`prepare` 返回已有同产物草稿时继续该草稿；不同任务的草稿可以并存。完整阅读任务包的 `stage_guide.instructions`、`facts`、`inputs` 和相关决定，只写 `draft_output`、`result_output` 以及实现所需代码。
+`prepare` 返回已有同产物草稿时继续该草稿，并把新的用户补充要求追加到该任务包；不同任务的草稿可以并存。完整阅读任务包的 `stage_guide.instructions`、`facts`、`inputs` 和相关决定，只写 `draft_output`、`result_output` 以及实现所需代码。
 
 ## 实现原则
 
@@ -57,11 +57,11 @@ python3 <aiwf.py> review --workspace <workspace> --artifact-id <id> --revision <
 
 提交后报告具体产物并等待用户审核，不自行批准。审核只改变该产物，不阻塞其他任务。
 
-修改已批准产物时调用 `revise`。人工直接修改 Markdown 视为该产物的新草稿来源；批准前仍使用上一个已批准结构化结果，不触发漂移门禁。
+修改已批准产物时调用 `revise`。新 revision 待审期间，新正文保存在 `.aiwf/history/` 快照中，用户可见的正式 Markdown 继续显示最近批准版；批准后才回写，期间存在更新的人工修改时不覆盖。人工直接修改 Markdown 视为该产物的新草稿来源，不触发漂移门禁。
 
 ## 需求变化
 
-需求和任务使用稳定 ID。批准修订后，引擎只把直接关联任务的已有产物标记为 `needs_reconcile`，不递归传播，也不影响无关任务。
+需求和任务使用稳定 ID。accepted 需求集合增减时只标记 design、task-plan 和移除需求直接关联的任务产物；需求行为变化只标记 design 和直接关联任务产物。实现修订只标记自身测试和一层直接依赖任务的实现、测试，不递归传播，也不影响无关任务。
 
 处理待核对产物时：
 

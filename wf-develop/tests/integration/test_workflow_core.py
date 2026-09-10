@@ -92,6 +92,55 @@ class WorkflowCoreTests(unittest.TestCase):
             self.assertEqual(first["work_id"], second["work_id"])
             self.assertNotEqual(first["work_id"], other["work_id"])
 
+    def test_existing_draft_keeps_new_user_instruction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            advance_to_tasks(
+                engine,
+                [{"key": "a", "title": "A", "requirements": ["REQ-001"], "depends_on": []}],
+            )
+            first = engine.prepare_work(active_item="T-001")
+
+            resumed = engine.prepare_work(
+                active_item="T-001",
+                instruction="Keep the acceptance criterion observable.",
+            )
+            stored = engine.store.read_json_path(
+                f".aiwf/work/{first['work_id']}/work.json"
+            )
+
+            self.assertEqual(resumed["work_id"], first["work_id"])
+            self.assertIn("Keep the acceptance criterion observable.", resumed["goal"])
+            self.assertEqual(
+                resumed["feedback"],
+                "Keep the acceptance criterion observable.",
+            )
+            self.assertEqual(stored, resumed)
+
+    def test_existing_draft_deduplicates_repeated_multiline_instruction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            engine = bootstrap_engine(workspace)
+            advance_to_tasks(
+                engine,
+                [{"key": "a", "title": "A", "requirements": ["REQ-001"], "depends_on": []}],
+            )
+            first = engine.prepare_work(active_item="T-001")
+            instruction = "Keep the acceptance criterion observable.\nInclude direct evidence."
+
+            engine.prepare_work(active_item="T-001", instruction=instruction)
+            resumed = engine.prepare_work(active_item="T-001", instruction=instruction)
+            stored = engine.store.read_json_path(
+                f".aiwf/work/{first['work_id']}/work.json"
+            )
+
+            self.assertEqual(stored, resumed)
+            self.assertEqual(resumed["goal"].count(instruction), 1)
+            self.assertEqual(resumed["feedback"], instruction)
+
     def test_zero_code_change_implementation_is_valid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "workspace"

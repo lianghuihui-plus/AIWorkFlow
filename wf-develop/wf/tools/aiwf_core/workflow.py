@@ -108,7 +108,44 @@ class WorkflowEngine:
             if corrupt is not None:
                 self._raise_corrupt_work(corrupt)
             if selected.get("work_id"):
-                return self._read_work(str(selected["work_id"]))
+                existing_work = self._read_work(str(selected["work_id"]))
+                instruction_text = instruction.strip()
+                if not instruction_text:
+                    return existing_work
+                prior_feedback = existing_work.get("feedback") or ""
+                if f"\n{instruction_text}\n" in f"\n{prior_feedback}\n":
+                    return existing_work
+                updated_work = {
+                    **existing_work,
+                    "goal": (
+                        f"{existing_work['goal']} "
+                        f"当前用户补充要求：{instruction_text}"
+                    ),
+                    "feedback": "\n".join(
+                        item for item in (prior_feedback, instruction_text) if item
+                    ),
+                }
+                timestamp = now_iso()
+                self.store.commit_locked(
+                    {
+                        self._work_path(updated_work["work_id"], "work.json"): json_bytes(
+                            updated_work
+                        ),
+                        ".aiwf/state.json": self._updated_state_bytes(timestamp),
+                    },
+                    event_type="work_instruction_added",
+                    event_data={
+                        "work_id": updated_work["work_id"],
+                        "stage": updated_work["stage"],
+                        "active_item": updated_work["active_item"],
+                    },
+                    command_key=(
+                        f"instruction:{updated_work['work_id']}:"
+                        f"{self._digest({'instruction': instruction_text})}"
+                    ),
+                    request_digest=self._digest({"instruction": instruction_text}),
+                )
+                return self._read_work(str(updated_work["work_id"]))
 
             stage = str(selected["stage"])
             task_id = selected.get("active_item")
@@ -1178,14 +1215,15 @@ class WorkflowEngine:
                 if item_id in current_requirements
             }
 
-        scope_added, behavior_changes = requirement_change_sets(
+        scope_changes, behavior_changes = requirement_change_sets(
             list(work_requirements.values()), list(relevant_requirements.values())
         )
-        requirement_changes = (
-            scope_added
-            if work["stage"] == "specification" and work.get("active_item") is None
-            else behavior_changes
-        )
+        if work["stage"] == "design":
+            requirement_changes = scope_changes.union(behavior_changes)
+        elif work["stage"] == "specification" and work.get("active_item") is None:
+            requirement_changes = scope_changes
+        else:
+            requirement_changes = behavior_changes
         reasons.update(
             f"requirement:{requirement_id}"
             for requirement_id in requirement_changes
